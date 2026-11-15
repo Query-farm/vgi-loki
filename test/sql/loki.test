@@ -1,148 +1,557 @@
 # name: test/sql/loki.test
-# description: SQL-level tests for the loki worker, run through DuckDB by ci/run-integration.sh
+# description: SQL tests for the loki worker against recorded Loki responses (test/fixture_server)
 # group: [loki]
-# managed-by: vgi-starters (edit upstream in shared/, then run tools/render.py)
 
 require vgi
 
 require-env LOKI_WORKER
 
-require-env LOKI_MOCK_API
+require-env LOKI_FIXTURE_URL
 
-require-env LOKI_MOCK_API_AUTH
+require-env LOKI_FIXTURE_AUTH_URL
 
 statement ok
 ATTACH 'loki' (TYPE vgi, LOCATION '{LOKI_WORKER}');
 
-# ---------------------------------------------------------------- greet (scalar)
+# vgi-go 0.42.0 cannot decode a pushed TIMESTAMPTZ filter in a non-UTC
+# session (see README "Known limitations"), so the suite pins UTC.
+statement ok
+INSTALL icu;
+
+statement ok
+LOAD icu;
+
+statement ok
+SET TimeZone = 'UTC';
+
+# ------------------------------------------------------------------ offline LogQL tools
 
 query T
-SELECT loki.main.greet('Ada');
+SELECT loki.main.logql_quote('say "hi" to C:\temp');
 ----
-Hi, Ada!
+"say \"hi\" to C:\\temp"
 
 query T
-SELECT loki.main.greet('Ada', 'formal');
-----
-Good day, Ada.
-
-# NULL in, NULL out.
-query T
-SELECT loki.main.greet(NULL);
+SELECT loki.main.logql_quote(NULL);
 ----
 NULL
 
-# Works over a whole column, one result per row.
-query T
-SELECT loki.main.greet(name) FROM (VALUES ('Ada'), ('Grace'), (NULL)) AS t(name) ORDER BY ALL NULLS LAST;
+query TT
+SELECT q, loki.main.query_type(q) FROM (VALUES ('{app="x"} |= "err"'), ('(  {app="x"} | json )'), ('rate({app="x"}[5m])'), ('vector(1)'), ('{app="x" |= "a"'), ('{app="x}')) t(q) ORDER BY q;
 ----
-Hi, Ada!
-Hi, Grace!
+(  {app="x"} | json )	log
+rate({app="x"}[5m])	metric
+vector(1)	metric
+{app="x" |= "a"	NULL
+{app="x"} |= "err"	log
+{app="x}	NULL
+
+query T
+SELECT loki.main.stream_selectors('sum(rate({app="api", level="error"} | line_format "{{.msg}}" [5m])) / sum(rate({app="api"}[5m])) # {not="this"}');
+----
+['{app="api", level="error"}', '{app="api"}']
+
+query T
+SELECT loki.main.selector_labels('sum(count_over_time({namespace="shop", app=~"check.*"} | json [5m])) / sum(count_over_time({namespace="shop"}[5m]))');
+----
+[app, namespace]
+
+# A malformed selector gives NULL rather than an error.
+query T
+SELECT loki.main.selector_labels('{app}');
+----
 NULL
 
-# `style` is constrained to 'casual' | 'formal' and checked when the query is bound.
-# (No expected message: each SDK words constraint errors its own way.)
+# ------------------------------------------------------------------ secrets
+
+# Without a secret every server function says how to create one.
 statement error
-SELECT loki.main.greet('Ada', 'loud');
+SELECT * FROM loki.main.build_info();
 ----
-<REGEX>:.*
+CREATE SECRET
 
-# ------------------------------------------------------ sequence_table (table fn)
+statement ok
+CREATE SECRET loki_fixture (TYPE loki, BASE_URL '{LOKI_FIXTURE_URL}');
 
+query TT
+SELECT version, revision FROM loki.main.build_info();
+----
+3.7.0	3361de24
+
+# ------------------------------------------------------------------ query_range: log queries
+
+# Log rows: ts, exact ns, hoisted stream labels, line, structured metadata, parsed fields.
+query TTTTTTTTT
+SELECT ts, ts_ns, job, namespace, pod, app, level, structured_metadata, parsed
+FROM loki.main.query_range('{app="checkout"} | logfmt', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', max_lines := 3);
+----
+2026-01-01 00:59:30+00	1767229170000000000	shop/checkout	shop	checkout-0	checkout	info	{detected_level=info, trace_id=trace-0119}	{duration_ms=403, method=GET, path=/cart/4, status=200}
+2026-01-01 00:59:00+00	1767229140000000000	shop/checkout	shop	checkout-0	checkout	info	{detected_level=info, trace_id=trace-0118, user_id=u6}	{duration_ms=366, method=GET, path=/cart/3, status=200}
+2026-01-01 00:58:30+00	1767229110000000000	shop/checkout	shop	checkout-0	checkout	info	{detected_level=info, trace_id=trace-0117}	{duration_ms=329, method=GET, path=/cart/2, status=200}
+
+# labels holds every stream label; parsed only holds parser output.
+query TT
+SELECT labels, line FROM loki.main.query_range('{app="checkout", level="error"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', max_lines := 1);
+----
+{app=checkout, job=shop/checkout, level=error, namespace=shop, pod=checkout-1, service_name=checkout}	method=POST path=/checkout status=500 error="payment declined"
+
+# 6,200 lines in one stream: more than the server's 5,000-line limit, so the scan pages.
+query IIIT
+SELECT count(*), count(DISTINCT line), count(DISTINCT ts_ns), min(ts) FROM loki.main.query_range('{app="bulk"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+6200	6200	6200	2026-01-01 01:00:00+00
+
+# Small pages, both directions, small chunks: still every line exactly once.
 query II
-SELECT n, squared FROM loki.main.sequence_table(4) ORDER BY n;
+SELECT count(*), count(DISTINCT line) FROM loki.main.query_range('{app="bulk"}', TIMESTAMPTZ '2026-01-01 01:00:00+00', TIMESTAMPTZ '2026-01-01 01:10:00+00', page_size := 333, direction := 'forward', chunk_seconds := 240);
 ----
-0	0
-1	1
-2	4
-3	9
+1200	1200
 
-# Named argument with a default.
-query I
-SELECT n FROM loki.main.sequence_table(3, step := 5) ORDER BY n;
+# Rows come out in scan order: oldest first for forward, newest first for backward.
+query TT
+SELECT first(line), last(line) FROM loki.main.query_range('{app="bulk"}', TIMESTAMPTZ '2026-01-01 01:00:00+00', TIMESTAMPTZ '2026-01-01 01:10:00+00', page_size := 333, direction := 'forward');
 ----
-0
-5
-10
+batch row 00000 status=ok	batch row 01199 status=ok
 
-# Larger than one batch: the cursor must carry across process calls.
-query II
-SELECT count(*), max(n) FROM loki.main.sequence_table(25000);
+query TT
+SELECT first(line), last(line) FROM loki.main.query_range('{app="bulk"}', TIMESTAMPTZ '2026-01-01 01:00:00+00', TIMESTAMPTZ '2026-01-01 01:10:00+00', page_size := 333);
 ----
-25000	24999
+batch row 01199 status=ok	batch row 00000 status=ok
 
-query I
-SELECT count(*) FROM loki.main.sequence_table(0);
-----
-0
-
-# count is constrained to [0, 1000000].
-statement error
-SELECT * FROM loki.main.sequence_table(-1);
-----
-<REGEX>:.*
-
-# Named arguments are constrained too: step >= 1.
-statement error
-SELECT * FROM loki.main.sequence_table(3, step := 0);
-----
-<REGEX>:.*
-
-# ------------------------------------------------- fetch_items (REST table fn)
-
+# Nine entries on two timestamps: page boundaries fall inside a timestamp and
+# the duplicates at the boundary are dropped.
 query IIT
-SELECT count(*), sum(id), min(name) FROM loki.main.fetch_items('{LOKI_MOCK_API}', page_size := 4);
+SELECT count(*), count(DISTINCT line), string_agg(line, ',' ORDER BY line) FROM loki.main.query_range('{app="ties"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', page_size := 7);
 ----
-25	325	item-01
+9	9	tie-0,tie-1,tie-2,tie-3,tie-4,tie-5,tie-late-0,tie-late-1,tie-late-2
+
+query II
+SELECT count(*), count(DISTINCT line) FROM loki.main.query_range('{app="ties"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', page_size := 7, direction := 'forward');
+----
+9	9
+
+# Five pages cannot get past six entries sharing one timestamp: a clear error, never silent loss.
+statement error
+SELECT count(*) FROM loki.main.query_range('{app="ties"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', page_size := 5);
+----
+share the timestamp
+
+# max_lines stops the scan; the window end is exclusive.
+query IT
+SELECT count(*), max(ts) FROM loki.main.query_range('{app="bulk"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 01:51:39.5+00', max_lines := 10);
+----
+10	2026-01-01 01:51:39+00
+
+# A multi-line entry keeps its newlines.
+query I
+SELECT count(*) FROM loki.main.query_range('{app="payments"} |= "panic"', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE line LIKE '%' || chr(10) || chr(9) || 'at charge.go:42%';
+----
+1
+
+# An empty result is fine.
+query I
+SELECT count(*) FROM loki.main.query_range('{app="checkout"} |= "no such text"', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+0
+
+# ------------------------------------------------------------------ query_range: metric queries
+
+query TTTTR
+SELECT result_type, metric, job, labels['level'], value FROM loki.main.query_range('sum by (level) (count_over_time({app="checkout"}[30m]))', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', step := 1800) ORDER BY labels['level'], ts;
+----
+matrix	NULL	NULL	error	10.0
+matrix	NULL	NULL	error	10.0
+matrix	NULL	NULL	info	1.0
+matrix	NULL	NULL	info	60.0
+matrix	NULL	NULL	info	59.0
+
+# The default step is Loki's: max(1, floor(range / 250)) seconds.
+query IT
+SELECT count(*), min(ts) FROM loki.main.query_range('sum(count_over_time({app="checkout"}[30m]))', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+192	2026-01-01 00:00:00+00
+
+# Chunked under max_points_per_chunk: the same rows as one request.
+query IR
+SELECT count(*), sum(value) FROM loki.main.query_range('sum(count_over_time({app="checkout"}[30m]))', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', max_points_per_chunk := 40);
+----
+192	8999.0
+
+query IR
+SELECT count(*), sum(value) FROM loki.main.query_range('sum(count_over_time({app="checkout"}[30m]))', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+192	8999.0
+
+# Metric rows have exactly vgi-prometheus's layout, so they UNION with it.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM loki.main.query_range('rate({app="x"}[1m])', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 00:00:00+00'));
+----
+result_type	VARCHAR
+metric	VARCHAR
+job	VARCHAR
+instance	VARCHAR
+labels	MAP(VARCHAR, VARCHAR)
+ts	TIMESTAMP WITH TIME ZONE
+value	DOUBLE
+histogram	STRUCT(count DOUBLE, sum DOUBLE, buckets STRUCT(lower DOUBLE, upper DOUBLE, count DOUBLE, lower_inclusive BOOLEAN, upper_inclusive BOOLEAN)[])
+string_value	VARCHAR
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM loki.main.query_range('{app="x"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 00:00:00+00'));
+----
+ts	TIMESTAMP WITH TIME ZONE
+ts_ns	BIGINT
+job	VARCHAR
+namespace	VARCHAR
+pod	VARCHAR
+app	VARCHAR
+level	VARCHAR
+labels	MAP(VARCHAR, VARCHAR)
+line	VARCHAR
+structured_metadata	MAP(VARCHAR, VARCHAR)
+parsed	MAP(VARCHAR, VARCHAR)
+
+statement error
+SELECT * FROM loki.main.query_range('{app="x"', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 01:00:00+00');
+----
+unclosed
+
+statement error
+SELECT * FROM loki.main.query_range('{app="x"}', TIMESTAMPTZ '2026-01-01 01:00:00+00', TIMESTAMPTZ '2026-01-01 00:00:00+00');
+----
+is before start
+
+# ------------------------------------------------------------------ query (instant)
+
+query TR
+SELECT labels['level'], value FROM loki.main.query('sum by (level) (count_over_time({app="checkout"}[2h]))', time := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY 1;
+----
+error	20.0
+info	119.0
+
+query TR
+SELECT result_type, value FROM loki.main.query('vector(2) * 3', time := TIMESTAMPTZ '2026-01-01 00:00:00+00');
+----
+vector	6.0
+
+# Loki evaluates only metric queries at an instant.
+statement error
+SELECT * FROM loki.main.query('{app="checkout"}');
+----
+is a log query
+
+# A server-side parse error carries the status and Loki's message.
+statement error
+SELECT * FROM loki.main.query('sum(rate({app="checkout"}[5m])) by', time := TIMESTAMPTZ '2026-01-01 00:00:00+00');
+----
+HTTP 400
+
+# ------------------------------------------------------------------ logs(): pushdown
+
+# app/level become stream matchers, the LIKE a |= line filter, ts the window.
+query TI
+SELECT pod, count(*) FROM loki.main.logs() WHERE app = 'checkout' AND level = 'error' AND line LIKE '%declined%' AND ts >= TIMESTAMPTZ '2026-01-01 00:00:00+00' AND ts < TIMESTAMPTZ '2026-01-01 02:00:00+00' GROUP BY pod;
+----
+checkout-1	13
+
+# IN, NOT contains, NOT LIKE, LIKE prefix and BETWEEN together.
+query I
+SELECT count(*) FROM loki.main.logs('{namespace="shop"}') WHERE app IN ('checkout', 'payments') AND NOT contains(line, 'GET') AND line NOT LIKE '%refund%' AND pod LIKE 'pay%' AND ts BETWEEN TIMESTAMPTZ '2026-01-01 00:00:00+00' AND TIMESTAMPTZ '2026-01-01 02:00:00+00';
+----
+16
+
+# The same answer with nothing pushed except the window proves the pushdown is exact.
+query I
+SELECT count(*) FROM (SELECT * FROM loki.main.logs('{namespace="shop"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') OFFSET 0) WHERE app IN ('checkout', 'payments') AND NOT contains(line, 'GET') AND line NOT LIKE '%refund%' AND pod LIKE 'pay%';
+----
+16
+
+# Quotes and backslashes in a pushed line filter are escaped for LogQL.
+query T
+SELECT line FROM loki.main.logs('{app="weird"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE contains(line, 'say "hello" to C:\temp');
+----
+say "hello" to C:\temp\new
+
+# LIKE wildcards are SQL's, not LogQL's: '%' and '_' in the data match literally only where SQL says so.
+query T
+SELECT line FROM loki.main.logs('{app="weird"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE line LIKE '100% done_ok%';
+----
+100% done_ok (literal LIKE wildcards)
+
+# Tabs and non-ASCII text survive the round trip.
+query I
+SELECT count(*) FROM loki.main.logs('{app="weird"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE contains(line, 'tab' || chr(9) || 'here and café ☃');
+----
+1
+
+# A label value with quotes and a backslash, through label_columns.
+query TT
+SELECT path, line FROM loki.main.logs(label_columns := 'path', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE path = 'C:\temp "x"' AND ts_ns = 1767225800000000000;
+----
+C:\temp "x"	say "hello" to C:\temp\new
+
+# ts_ns bounds are exact nanoseconds: [start, end).
+query I
+SELECT count(*) FROM loki.main.logs('{app="checkout", level="error"}') WHERE ts_ns >= 1767225615250000000 AND ts_ns < 1767226335250000000;
+----
+4
+
+# ORDER BY ts DESC LIMIT n becomes a backward query with that limit.
+query TT
+SELECT ts, line FROM loki.main.logs('{app="checkout"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY ts DESC LIMIT 2;
+----
+2026-01-01 00:59:30+00	method=GET path=/cart/4 status=200 duration_ms=403
+2026-01-01 00:59:00+00	method=GET path=/cart/3 status=200 duration_ms=366
+
+query TT
+SELECT ts, line FROM loki.main.logs('{app="checkout"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY ts LIMIT 2;
+----
+2026-01-01 00:00:00+00	method=GET path=/cart/0 status=200 duration_ms=0
+2026-01-01 00:00:15.00025+00	method=POST path=/checkout status=500 error="upstream timeout"
+
+# Filters DuckDB keeps (map lookups) still combine correctly with ORDER BY ... LIMIT.
+query TT
+SELECT ts, structured_metadata['trace_id'] FROM loki.main.logs('{app="checkout"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE structured_metadata['user_id'] = 'u3' ORDER BY ts DESC LIMIT 2;
+----
+2026-01-01 00:54:00+00	trace-0108
+2026-01-01 00:47:00+00	trace-0094
+
+# Parsed fields come from the parser in the selector argument.
+query TI
+SELECT parsed['path'], count(*) FROM loki.main.logs('{app="checkout", level="info"} | logfmt', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') GROUP BY 1 ORDER BY 1;
+----
+/cart/0	24
+/cart/1	24
+/cart/2	24
+/cart/3	24
+/cart/4	24
+
+# Line filters are appended after the pipeline, so they test the final line (after line_format).
+query I
+SELECT count(*) FROM loki.main.logs('{app="payments"} | json | line_format "{{.msg}}"', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE line = 'refund';
+----
+15
+
+# A pipeline that drops or rewrites labels turns label pushdown off, so this stays exact.
+query I
+SELECT count(*) FROM loki.main.logs('{app="ties"} | drop job', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE job IS NULL;
+----
+9
+
+query I
+SELECT count(*) FROM loki.main.logs('{app="ties"} | label_format app="renamed"', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE app IS NULL AND parsed['app'] = 'renamed';
+----
+9
+
+# max_lines counts rows that pass the worker-side filters.
+query I
+SELECT count(*) FROM loki.main.logs('{app="bulk"}', max_lines := 4, start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE line LIKE '%status=failed%';
+----
+4
+
+# Loki needs one non-empty matcher.
+statement error
+SELECT * FROM loki.main.logs() WHERE line LIKE '%x%';
+----
+at least one stream matcher
+
+statement error
+SELECT * FROM loki.main.logs('{app!="x"}');
+----
+at least one stream matcher
+
+statement error
+SELECT * FROM loki.main.logs('sum(rate({app="x"}[5m]))');
+----
+is not a log query
+
+statement error
+SELECT * FROM loki.main.logs('{app="x"}', label_columns := 'line');
+----
+already a column
+
+# ------------------------------------------------------------------ stream metadata
+
+query T
+SELECT label FROM loki.main.labels(match := '{namespace="shop"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY label;
+----
+app
+job
+level
+namespace
+pod
+service_name
+
+query T
+SELECT value FROM loki.main.label_values('app', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY value;
+----
+bulk
+checkout
+payments
+ties
+weird
+
+query TTTT
+SELECT app, pod, level, labels['service_name'] FROM loki.main.series('{namespace="shop"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY app, pod;
+----
+checkout	checkout-0	info	checkout
+checkout	checkout-1	error	checkout
+payments	payments-0	NULL	payments
+
+query IIII
+SELECT streams, chunks, entries, bytes > 0 FROM loki.main.index_stats('{namespace="shop"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+3	3	171	true
+
+query TT
+SELECT labels['namespace'], bytes > 0 FROM loki.main.volume('{namespace=~".+"}', target_labels := 'namespace', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY 1;
+----
+batch	true
+misc	false
+shop	true
+
+query TTITT
+SELECT field, type, cardinality, parsers, json_path FROM loki.main.detected_fields('{app="payments"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY field;
+----
+amount	int	30	[json]	[amount]
+currency	string	1	[json]	[currency]
+detected_level	string	3	[]	[]
+level	string	2	[json]	[level]
+msg	string	2	[json]	[msg]
 
 query TI
-SELECT category, count(*) FROM loki.main.fetch_items('{LOKI_MOCK_API}') GROUP BY category ORDER BY category;
+SELECT label, cardinality FROM loki.main.detected_labels(query := '{namespace="shop"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY label;
 ----
-hardware	8
-service	8
-software	9
+app	2
+job	2
+level	2
+namespace	1
+pod	3
+service_name	2
 
-# The harness runs LOKI_MOCK_API with MOCK_API_FLAKY=1: every page answers
-# 429 + Retry-After once, so every query above also exercised the retry path.
+# The pattern ingester only tracks recent data, so the recorded fixture has none for 2026-01-01 ...
+query I
+SELECT count(*) FROM loki.main.patterns('{app="bulk"}', start_date := TIMESTAMPTZ '2026-01-01 01:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00');
+----
+0
 
-# LOKI_MOCK_API_AUTH requires a bearer token ('test-token'). Every language's
-# fetch_items must put the HTTP status code in its error message.
+# ... and a hand-written response (handwritten.json) checks the decoding.
+query TTTI
+SELECT pattern, level, ts, count FROM loki.main.patterns('{app="patterned"}', step := 60, start_date := TIMESTAMPTZ '2026-01-01 01:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY pattern, ts;
+----
+batch row <_> status=failed	NULL	2026-01-01 01:01:00+00	2
+batch row <_> status=ok	info	2026-01-01 01:00:00+00	120
+batch row <_> status=ok	info	2026-01-01 01:01:00+00	118
+
+# An older Loki without the endpoint: a 404 that says what is missing.
 statement error
-SELECT count(*) FROM loki.main.fetch_items('{LOKI_MOCK_API_AUTH}');
+SELECT * FROM loki.main.detected_fields('{app="old"}', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00');
 ----
-401
+needs Loki 3.0+
+
+# ------------------------------------------------------------------ ruler
+
+query TTTTRT
+SELECT group_name, rule_name, rule_type, query, duration_seconds, labels FROM loki.main.rules() ORDER BY group_name, rule_name;
+----
+fixture-alerts	CheckoutErrors	alerting	(sum by (app)(count_over_time({app="checkout", level="error"}[5m])) > 10)	300.0	{severity=page}
+fixture-alerts	FixtureAlwaysFiring	alerting	(vector(1.000000) > 0)	0.0	{severity=info}
+fixture-recording	app:log_lines:rate5m	recording	sum by (app)(rate({namespace="shop"}[5m]))	NULL	{}
+
+query TT
+SELECT rule_name, state FROM loki.main.rules(rule_type := 'alert') ORDER BY rule_name;
+----
+CheckoutErrors	inactive
+FixtureAlwaysFiring	firing
+
+query TT
+SELECT rule_name, loki.main.selector_labels(query) FROM loki.main.rules(rule_type := 'record');
+----
+app:log_lines:rate5m	[namespace]
+
+query TTR
+SELECT alert_name, state, value FROM loki.main.alerts() ORDER BY alert_name;
+----
+FixtureAlwaysFiring	firing	1.0
+
+# ------------------------------------------------------------------ format_query
+
+query TTT
+SELECT valid, formatted, error FROM loki.main.format_query('sum(rate({app="x"}|="a"[5m]))by(b)');
+----
+true	sum by (b)(rate({app="x"} |= "a"[5m]))	NULL
+
+query TTT
+SELECT valid, formatted IS NULL, error FROM loki.main.format_query('{app="x"');
+----
+false	true	parse error at line 1, col 9: syntax error: unexpected $end, expecting } or ,
+
+# ------------------------------------------------------------------ errors and retries
+
+# The fixture answers every request with 429 + Retry-After once; every query
+# above passed through a retry. A persistent 503 fails with the status.
+statement error
+SELECT * FROM loki.main.query('sum(count_over_time({app="unavailable"}[5m]))', time := TIMESTAMPTZ '2026-01-01 00:00:00+00');
+----
+HTTP 503
+
+# A warning in the response is logged, not fatal.
+query R
+SELECT value FROM loki.main.query('sum(count_over_time({app="warned"}[5m]))', time := TIMESTAMPTZ '2026-01-01 00:00:00+00');
+----
+4.0
+
+# ------------------------------------------------------------------ authentication, tenants, named secrets
 
 statement ok
-CREATE SECRET loki_api_test (TYPE loki_api, TOKEN 'test-token');
-
-query I
-SELECT count(*) FROM loki.main.fetch_items('{LOKI_MOCK_API_AUTH}', page_size := 25);
-----
-25
-
-# Several pages: the token must survive between batches (over HTTP each batch is a
-# separate request, so a token kept only in memory is lost after page 1).
-query I
-SELECT count(*) FROM loki.main.fetch_items('{LOKI_MOCK_API_AUTH}', page_size := 7);
-----
-25
+CREATE SECRET loki_bearer (TYPE loki, BASE_URL '{LOKI_FIXTURE_AUTH_URL}', BEARER_TOKEN 'test-token', TENANT_ID 'tenant-a');
 
 statement ok
-DROP SECRET loki_api_test;
+CREATE SECRET loki_basic (TYPE loki, BASE_URL '{LOKI_FIXTURE_AUTH_URL}', USERNAME 'grafana', PASSWORD 'secret-key', EXTRA_HEADERS '{"X-Scope-OrgID": "tenant-a"}');
 
-# base_url must be http(s).
-statement error
-SELECT * FROM loki.main.fetch_items('ftp://example.com');
-----
-<REGEX>:.*
+statement ok
+CREATE SECRET loki_no_tenant (TYPE loki, BASE_URL '{LOKI_FIXTURE_AUTH_URL}', BEARER_TOKEN 'test-token');
 
-# page_size is a named argument constrained to [1, 1000].
-statement error
-SELECT * FROM loki.main.fetch_items('{LOKI_MOCK_API}', page_size := 0);
+query T
+SELECT version FROM loki.main.build_info(secret_name := 'loki_bearer');
 ----
-<REGEX>:.*
+3.7.0
+
+query T
+SELECT version FROM loki.main.build_info(secret_name := 'loki_basic');
+----
+3.7.0
+
+query I
+SELECT count(*) FROM loki.main.query_range('{app="ties"}', TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', secret_name := 'loki_bearer');
+----
+9
+
+query I
+SELECT count(*) FROM loki.main.logs(secret_name := 'loki_basic', start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') WHERE app = 'ties';
+----
+9
 
 statement error
-SELECT * FROM loki.main.fetch_items('{LOKI_MOCK_API}', page_size := 5000);
+SELECT * FROM loki.main.build_info(secret_name := 'loki_no_tenant');
 ----
-<REGEX>:.*
+HTTP 403
+
+statement error
+SELECT * FROM loki.main.build_info(secret_name := 'no_such_secret');
+----
+no_such_secret
+
+# Secret values never show up in duckdb_secrets().
+query T
+SELECT bool_or(secret_string LIKE '%test-token%' OR secret_string LIKE '%secret-key%') FROM duckdb_secrets();
+----
+false
+
+statement ok
+CREATE SECRET bad_url (TYPE loki, BASE_URL 'ftp://example.invalid');
+
+statement error
+SELECT * FROM loki.main.build_info(secret_name := 'bad_url');
+----
+must be an http(s) URL

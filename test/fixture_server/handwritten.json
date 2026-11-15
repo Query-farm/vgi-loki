@@ -1,0 +1,18 @@
+{
+ "/loki/api/v1/detected_fields?end=1767232800000000000&query=%7Bapp%3D%22old%22%7D&start=1767225600000000000": {
+  "body": "404 page not found\n",
+  "status": 404
+ },
+ "/loki/api/v1/patterns?end=1767232800000000000&query=%7Bapp%3D%22patterned%22%7D&start=1767229200000000000&step=60": {
+  "body": "{\"status\": \"success\", \"data\": [{\"pattern\": \"batch row <_> status=ok\", \"level\": \"info\", \"samples\": [[1767229200, 120], [1767229260, 118]]}, {\"pattern\": \"batch row <_> status=failed\", \"samples\": [[1767229260, 2]]}]}",
+  "status": 200
+ },
+ "/loki/api/v1/query?query=sum%28count_over_time%28%7Bapp%3D%22unavailable%22%7D%5B5m%5D%29%29&time=1767225600000000000": {
+  "body": "fixture outage",
+  "status": 503
+ },
+ "/loki/api/v1/query?query=sum%28count_over_time%28%7Bapp%3D%22warned%22%7D%5B5m%5D%29%29&time=1767225600000000000": {
+  "body": "{\"status\": \"success\", \"data\": {\"resultType\": \"vector\", \"result\": [{\"metric\": {}, \"value\": [1767225600, \"4\"]}]}, \"warnings\": [\"fixture warning: results may be incomplete\"]}",
+  "status": 200
+ }
+}

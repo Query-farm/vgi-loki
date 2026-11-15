@@ -35,9 +35,12 @@ type category struct {
 // SchemaCategories group functions in docs and agent tools. Every function's
 // vgi.category must name one of these.
 var SchemaCategories = []category{
-	{Name: "text", Title: "Text", Description: "Functions that build or transform strings."},
-	{Name: "generators", Title: "Generators", Description: "Table functions that generate rows."},
-	{Name: "api", Title: "REST APIs", Description: "Table functions that read from HTTP APIs."},
+	{Name: "query", Title: "LogQL Queries", Description: "Run arbitrary LogQL: log queries as log rows, metric queries as long metric rows."},
+	{Name: "logs", Title: "Log Lines", Description: "Typed log rows with SQL filter pushdown into LogQL selectors, line filters and the time window."},
+	{Name: "metadata", Title: "Stream Metadata", Description: "Labels, label values, streams, index statistics, volume, detected fields and labels, patterns."},
+	{Name: "rules", Title: "Ruler", Description: "LogQL recording and alerting rules and active alerts from Loki's ruler."},
+	{Name: "logql", Title: "LogQL Tools", Description: "Quote, classify and inspect LogQL locally; validate and format it on the server."},
+	{Name: "status", Title: "Server Status", Description: "Server version and build information."},
 }
 
 // mustJSON marshals v, panicking on failure (only static data is passed).
@@ -124,40 +127,47 @@ func withExamples(tags map[string]string, lists ...[]vgi.CatalogExample) map[str
 	return tags
 }
 
-const catalogDocLLM = "An example VGI worker generated from the Query.Farm starter template. It " +
-	"shows the three shapes most workers need: a vectorized scalar function with an overload, a " +
-	"deterministic table function with a named default argument, and a table function that pages " +
-	"through a REST API with retries and an optional bearer token taken from a DuckDB secret or an " +
-	"environment variable. Replace them with your own functions; keep the metadata complete so " +
-	"agents can discover and call them."
+const catalogDocLLM = "Query Grafana Loki (self-hosted, or Grafana Cloud Logs with basic auth) from SQL, read-only. Every " +
+	"server function needs a DuckDB secret: CREATE SECRET (TYPE loki, BASE_URL 'http://host:3100', BEARER_TOKEN or " +
+	"USERNAME/PASSWORD, optional TENANT_ID sent as X-Scope-OrgID, optional EXTRA_HEADERS as a JSON object). " +
+	"query_range(logql, start, end) runs any LogQL: a log query returns one row per line (ts, ts_ns, job, namespace, pod, " +
+	"app, level, labels map, line, structured_metadata map, parsed map), paged past the server's 5000-line limit with " +
+	"de-duplication; a metric query returns vgi-prometheus's long layout (labels map, ts, value, ...) so it UNIONs with " +
+	"Prometheus data. query(logql, time := ...) is an instant metric query. logs(selector) returns the same log rows with " +
+	"SQL WHERE filters pushed down: label columns become stream matchers, line LIKE/contains become |= line filters, ts " +
+	"ranges become the window, ORDER BY ts DESC LIMIT n becomes a backward limited query. labels, label_values, series, " +
+	"index_stats, volume, detected_fields, detected_labels and patterns read stream metadata; rules and alerts read the " +
+	"ruler; build_info and format_query (server-side LogQL validation) are utilities. logql_quote, query_type, " +
+	"stream_selectors and selector_labels run locally with no server."
 
-// CatalogDocMD is the catalog's long human-facing description (also its comment).
-const CatalogDocMD = "# VGI loki worker\n\n" +
-	"**An example [VGI](https://query.farm/vgi) worker that brings custom functions into DuckDB " +
-	"SQL.** It was generated from the Query.Farm starter template and is meant to be renamed and " +
-	"rewritten: every function here demonstrates one pattern you will reuse, from vectorized scalars " +
-	"and streaming table functions to a REST API reader that retries politely and reads a bearer " +
-	"token from a DuckDB secret or the environment.\n\n" +
-	"The worker speaks Apache Arrow to DuckDB over stdin/stdout, a Unix socket, or HTTP, so the " +
-	"same code runs as a local subprocess or a hosted service. See the " +
-	"[VGI documentation](https://query.farm/vgi/docs/) to learn more."
+// CatalogDocMD is the catalog's comment: one short paragraph for directories.
+const CatalogDocMD = "Query Grafana Loki and Grafana Cloud Logs from DuckDB: LogQL log and metric queries as typed rows, " +
+	"log lines with SQL filters pushed into LogQL, stream metadata, ruler rules and alerts, and offline LogQL tools."
 
-const schemaDocLLM = "The `main` schema holds the starter template's example functions, one per common worker " +
-	"pattern. `greet(name)` and `greet(name, style)` are vectorized scalars: use them inside a " +
-	"projection or predicate, one result per row; `style` is a constant that must be 'casual' or " +
-	"'formal'. `sequence_table(count, step := 1)` is a deterministic table function that returns " +
-	"`count` rows of `(n, squared)`; use it for demos, tests, and as a template for generators. " +
-	"`fetch_items(base_url, page_size := 100)` reads every item from a paginated JSON REST API as " +
-	"`(id, name, category, price)` rows, streaming one page per batch, retrying rate-limited " +
-	"requests, and authenticating with a `loki_api` DuckDB secret or the `LOKI_API_TOKEN` " +
-	"environment variable. Scalars cannot take named arguments; table functions can."
+const catalogDocMDLong = "# Loki in DuckDB\n\n" +
+	"Run LogQL against Grafana Loki and get typed rows back: log lines with `TIMESTAMPTZ` and exact nanosecond " +
+	"timestamps, stream labels hoisted into columns and kept as a `MAP`, structured metadata and parsed fields as maps; " +
+	"metric queries in the same long layout as vgi-prometheus, so logs-derived and Prometheus metrics UNION.\n\n" +
+	"- **query_range / query**: arbitrary LogQL; log results are paged past the 5000-line limit, metric ranges chunked under 11,000 points.\n" +
+	"- **logs**: SQL `WHERE` filters become stream matchers, line filters and the time window; every filter is re-applied exactly.\n" +
+	"- **Metadata**: labels, values, streams, index stats, volume, detected fields and labels, patterns.\n" +
+	"- **Ruler**: LogQL rules and active alerts.\n" +
+	"- **LogQL tools**: quote, classify and inspect LogQL offline; validate on the server.\n\n" +
+	"Credentials come from a `loki` DuckDB secret (bearer token or basic auth, optional tenant header)."
+
+const schemaDocLLM = "The main schema holds every function. Table functions that call the server take an optional " +
+	"secret_name named argument (default: the loki secret whose scope matches). Window arguments are start_date/end_date " +
+	"(query_range takes start and end positionally); log windows are [start, end). Log rows: read a stream label with " +
+	"labels['name'], a parsed field with parsed['name'] (add | json or | logfmt to the LogQL), structured metadata with " +
+	"structured_metadata['name']. In logs(), list a stream label in label_columns to get a pushdown column. Scalars " +
+	"(logql_quote, query_type, stream_selectors, selector_labels) take one VARCHAR column and need no secret."
 
 // SchemaDocMD is the main schema's human-facing description (also its comment).
 const SchemaDocMD = "## main\n\n" +
-	"The starter template's example functions, one per common worker pattern.\n\n" +
-	"- **Scalars** answer one question per row and slot into a projection or predicate.\n" +
-	"- **Table functions** return sets of rows, streamed to DuckDB in Arrow batches.\n" +
-	"- **REST readers** page through an HTTP API and authenticate with a DuckDB secret."
+	"Everything this worker exposes lives here. Table functions call the Loki HTTP API named by a `loki` secret; " +
+	"scalars inspect LogQL locally.\n\n" +
+	"Reach for `logs` when you want SQL filters pushed into LogQL, and for `query_range` when you need arbitrary " +
+	"LogQL such as parsers, `line_format` or metric aggregations."
 
 // agentTask is one public analyst task for `vgi-lint simulate`.
 type agentTask struct {
@@ -165,27 +175,37 @@ type agentTask struct {
 	Prompt string `json:"prompt"`
 }
 
-// agentTestTasks are graded privately by vgi-agent-tests.yaml.
+// agentTestTasks are graded privately by vgi-agent-tests.yaml. The server
+// tasks assume a loki secret pointing at the replay fixture (test/fixture_server).
 var agentTestTasks = []agentTask{
-	{Name: "formal_greeting", Prompt: "Using the loki worker, greet the name 'Grace' formally."},
-	{Name: "sum_of_squares", Prompt: "Using the loki worker, what is the sum of the squared column for the first 10 rows " +
-		"of the sequence with the default step?"},
-	{Name: "stepped_sequence", Prompt: "List the n values of a 4-row sequence that steps by 5, in ascending order."},
-	{Name: "items_per_category", Prompt: "The items API is running at https://vgi-starter-api.query-farm.services/v1. How many items does it have in each category?"},
+	{Name: "quote_literal", Prompt: "Using the loki worker, write the string say \"hello\" to C:\\temp as a LogQL string literal."},
+	{Name: "classify_queries", Prompt: "Using the loki worker, which of these LogQL queries are metric queries: '{app=\"x\"} |= \"err\"', " +
+		"'rate({app=\"x\"}[5m])', 'sum by (pod) (count_over_time({app=\"x\"}[1m]))'?"},
+	{Name: "rule_labels", Prompt: "Using the loki worker, which stream labels does the LogQL " +
+		"'sum(count_over_time({namespace=\"shop\", app=~\"check.*\"}[5m])) / sum(count_over_time({namespace=\"shop\"}[5m]))' select on?"},
+	{Name: "checkout_errors", Prompt: "How many error-level log lines did the checkout app write between 2026-01-01 00:00 and 02:00 UTC, per pod?"},
+	{Name: "declined_payments", Prompt: "How many checkout error lines between 2026-01-01 00:00 and 02:00 UTC mention 'payment declined'?"},
+	{Name: "bulk_failures", Prompt: "List the bulk app's lines with status=failed between 2026-01-01 01:00 and 02:00 UTC, oldest first."},
+	{Name: "levels_per_half_hour", Prompt: "Count checkout log lines per level in 30-minute buckets between 2026-01-01 00:00 and 02:00 UTC."},
+	{Name: "shop_apps", Prompt: "Which apps logged in the shop namespace between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "payments_fields", Prompt: "Which fields does Loki detect in the payments app's lines between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "shop_volume", Prompt: "How many entries and bytes does the shop namespace have between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "firing_alerts", Prompt: "Which Loki ruler alerts are currently firing?"},
+	{Name: "server_version", Prompt: "Which Loki version is the server running?"},
 }
 
 // CatalogTags are the catalog-level discovery tags.
 var CatalogTags = map[string]string{
 	"vgi.title":              "VGI Loki Worker",
-	"vgi.subtitle":           "Example DuckDB functions to rename and replace: a scalar, a table function and a REST API reader.",
+	"vgi.subtitle":           "LogQL log and metric queries, log lines with pushdown, stream metadata and ruler state from Grafana Loki.",
 	"vgi.doc_llm":            catalogDocLLM,
-	"vgi.doc_md":             CatalogDocMD,
+	"vgi.doc_md":             catalogDocMDLong,
 	"vgi.source_url":         SourceURL,
 	"vgi.icon_url":           "https://query.farm/media-kit/products/vgi/vgi-logo.png",
 	"vgi.license":            "0BSD",
 	"vgi.author":             "Query.Farm",
-	"vgi.copyright":          "Copyright 2026 Query.Farm LLC",
-	"vgi.keywords":           keywordsArray("vgi, duckdb, starter template, example worker, rest api, table function"),
+	"vgi.copyright":          "Copyright 2026 Query Farm LLC - https://query.farm",
+	"vgi.keywords":           keywordsArray("loki, logql, logs, log analytics, observability, grafana, grafana cloud logs, structured metadata, monitoring"),
 	"vgi.support_contact":    SourceURL + "/issues",
 	"vgi.support_policy_url": SourceURL + "#support",
 	// Public analyst tasks for `vgi-lint simulate`; private graders live in vgi-agent-tests.yaml.
@@ -196,8 +216,8 @@ var CatalogTags = map[string]string{
 func schemaTags(allExamples []exampleQuery) map[string]string {
 	return map[string]string{
 		"vgi.title":           "Loki Functions",
-		"domain":              "examples",
-		"vgi.keywords":        keywordsArray("greeting, sequence, generator, rest api, pagination"),
+		"domain":              "observability",
+		"vgi.keywords":        keywordsArray("logql, query_range, logs, labels, series, patterns, rules, alerts"),
 		"vgi.doc_llm":         schemaDocLLM,
 		"vgi.doc_md":          SchemaDocMD,
 		"vgi.categories":      mustJSON(SchemaCategories),

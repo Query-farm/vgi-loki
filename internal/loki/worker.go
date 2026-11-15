@@ -1,7 +1,7 @@
-// Package loki assembles the example functions into a catalog.
+// Package loki exposes the Grafana Loki HTTP API (and LogQL tools) as a VGI catalog.
 //
-// To add a function: write it (see greet.go / sequence.go / fetch_items.go),
-// then register it in NewWorker below.
+// To add a function: write it (see query.go, logs.go, catalog_funcs.go or
+// compute.go), then register it in NewWorker below.
 //
 // Run it:
 //
@@ -20,7 +20,10 @@ import (
 
 // allExamples lists every function's examples for the schema-level tag.
 func allExamples() []exampleQuery {
-	return exampleQueries(greetExamples, greetWithStyleExamples, sequenceExamples, fetchExamples)
+	lists := [][]vgi.CatalogExample{queryExamples, queryRangeExamples, logsExamples, labelsExamples, labelValuesExamples,
+		seriesExamples, statsExamples, volumeExamples, detectedFieldsExamples, detectedLabelsExamples, patternsExamples,
+		rulesExamples, alertsExamples, buildInfoExamples, formatExamples}
+	return exampleQueries(append(lists, toolsExamples()...)...)
 }
 
 // NewWorker builds the worker: one catalog, one main schema. Extra options
@@ -37,9 +40,15 @@ func NewWorker(opts ...vgi.WorkerOption) *vgi.Worker {
 		vgi.WithSecretTypes(APISecretType),
 	}
 	w := vgi.NewWorker(append(base, opts...)...)
-	w.RegisterScalar(vgi.AsScalarFunction[greetArgs](&Greet{}))
-	w.RegisterScalar(vgi.AsScalarFunction[greetWithStyleArgs](&GreetWithStyle{}))
-	w.RegisterTable(NewSequenceTable())
-	w.RegisterTable(NewFetchItems())
+	registerEvaluator()
+	w.RegisterTable(vgi.AsTableFunction[QueryState](&QueryFunc{}))
+	w.RegisterTable(vgi.AsTableFunction[RangeState](&QueryRangeFunc{}))
+	w.RegisterTable(vgi.AsTableFunction[LogsState](&LogsFunc{}))
+	w.RegisterTable(vgi.AsTableFunction[LogsState](&LogsFunc{NoSelector: true}))
+	for _, f := range []vgi.TableFunction{newLabels(), newLabelValues(), newSeries(), newIndexStats(), newVolume(),
+		newDetectedFields(), newDetectedLabels(), newPatterns(), newRules(), newAlerts(), newBuildInfo(), newFormatQuery()} {
+		w.RegisterTable(f)
+	}
+	registerTools(w)
 	return w
 }

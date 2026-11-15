@@ -13,10 +13,11 @@
 # Optional:
 #   TRANSPORT         stdio | launch | http                        (default: stdio)
 #   HAYBARN_UNITTEST  path to haybarn-unittest   (default: the one on PATH)
-#   PYTHON            command for the mock API, may contain spaces (default: python3)
+#   PYTHON            command for the fixture server, may contain spaces (default: python3)
 #   MIN_EXECUTED      fail if fewer test cases ran (default: 1)
 #   EXPECTED_SKIP_REASONS  newline-separated skip reasons that are allowed,
 #                     e.g. "require-env LOKI_LIVE". Any other skip fails.
+#   LOKI_RECORD_UPSTREAM  live Loki URL: record unrecorded responses
 #   RECIPES_WORKER    command that runs a recipe by name (`$RECIPES_WORKER <recipe>`);
 #                     when set, examples/test/*.test run too (stdio/launch only)
 #   KEEP_STAGE=1      keep the staged test tree for debugging
@@ -71,13 +72,18 @@ start_server() {
   echo "::error::'$*' never printed PORT:<n>"; cat "$log"; return 1
 }
 
-# The mock APIs fetch_items is tested against. The plain one rate-limits every
-# page once (429 + Retry-After) so the retry path is always exercised.
-unset LOKI_API_TOKEN
-MOCK_API_FLAKY=1 start_server "$STAGE/mock.log" $PYTHON "$REPO/test/mock_api/server.py"
-export LOKI_MOCK_API="http://127.0.0.1:$PORT"
-MOCK_API_TOKEN=test-token start_server "$STAGE/mock-auth.log" $PYTHON "$REPO/test/mock_api/server.py"
-export LOKI_MOCK_API_AUTH="http://127.0.0.1:$PORT"
+# The fixture API servers replay recorded Loki responses
+# (test/fixture_server). The plain one answers every request with
+# 429 + Retry-After once, so the retry path is always exercised; the auth one
+# demands credentials and a tenant header. With LOKI_RECORD_UPSTREAM set
+# (see README "How it is tested") they forward unrecorded requests to that live
+# Loki and save the answers.
+REC=()
+[ -n "${LOKI_RECORD_UPSTREAM:-}" ] && REC=(--record "$LOKI_RECORD_UPSTREAM")
+FIXTURE_FLAKY=1 start_server "$STAGE/fixture.log" $PYTHON "$REPO/test/fixture_server/server.py" ${REC[@]+"${REC[@]}"}
+export LOKI_FIXTURE_URL="http://127.0.0.1:$PORT"
+FIXTURE_REQUIRE_AUTH=1 start_server "$STAGE/fixture-auth.log" $PYTHON "$REPO/test/fixture_server/server.py" ${REC[@]+"${REC[@]}"}
+export LOKI_FIXTURE_AUTH_URL="http://127.0.0.1:$PORT"
 
 HTTP=0
 case "$TRANSPORT" in
@@ -118,6 +124,9 @@ INSTALL httpfs FROM core;
 
 statement ok
 INSTALL json FROM core;
+
+statement ok
+INSTALL icu FROM core;
 EOF
 "$HAYBARN_UNITTEST" --keep-home --test-dir "$STAGE" "test/_warm.test" >/dev/null 2>&1 \
   || echo "::warning::extension warm-up did not fully succeed"
