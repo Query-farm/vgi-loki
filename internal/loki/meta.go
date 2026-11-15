@@ -133,12 +133,12 @@ const catalogDocLLM = "Query Grafana Loki (self-hosted, or Grafana Cloud Logs wi
 	"query_range(logql, start, end) runs any LogQL: a log query returns one row per line (ts, ts_ns, job, namespace, pod, " +
 	"app, level, labels map, line, structured_metadata map, parsed map), paged past the server's 5000-line limit with " +
 	"de-duplication; a metric query returns vgi-prometheus's long layout (labels map, ts, value, ...) so it UNIONs with " +
-	"Prometheus data. query(logql, time := ...) is an instant metric query. logs(selector) returns the same log rows with " +
+	"Prometheus data; an instant metric query is also available. logs(selector) returns the same log rows with " +
 	"SQL WHERE filters pushed down: label columns become stream matchers, line LIKE/contains become |= line filters, ts " +
-	"ranges become the window, ORDER BY ts DESC LIMIT n becomes a backward limited query. labels, label_values, series, " +
-	"index_stats, volume, detected_fields, detected_labels and patterns read stream metadata; rules and alerts read the " +
-	"ruler; build_info and format_query (server-side LogQL validation) are utilities. logql_quote, query_type, " +
-	"stream_selectors and selector_labels run locally with no server."
+	"ranges become the window, ORDER BY ts DESC LIMIT n becomes a backward limited query. Other functions read stream " +
+	"metadata (label names and values, streams, index stats, volume, detected fields, patterns), the ruler's rules and " +
+	"active alerts, and server build info, and validate LogQL on the server; a set of scalars quote, classify and " +
+	"inspect LogQL locally with no server."
 
 // CatalogDocMD is the catalog's comment: one short paragraph for directories.
 const CatalogDocMD = "Query Grafana Loki and Grafana Cloud Logs from DuckDB: LogQL log and metric queries as typed rows, " +
@@ -159,15 +159,24 @@ const schemaDocLLM = "The main schema holds every function. Table functions that
 	"secret_name named argument (default: the loki secret whose scope matches). Window arguments are start_date/end_date " +
 	"(query_range takes start and end positionally); log windows are [start, end). Log rows: read a stream label with " +
 	"labels['name'], a parsed field with parsed['name'] (add | json or | logfmt to the LogQL), structured metadata with " +
-	"structured_metadata['name']. In logs(), list a stream label in label_columns to get a pushdown column. Scalars " +
-	"(logql_quote, query_type, stream_selectors, selector_labels) take one `VARCHAR` column and need no secret."
+	"structured_metadata['name']. In logs(), list a stream label in label_columns to get a pushdown column. The LogQL " +
+	"scalars take one `VARCHAR` expression and need no secret."
 
-// SchemaDocMD is the main schema's human-facing description (also its comment).
+// SchemaComment is the main schema's one-line comment.
+const SchemaComment = "LogQL log and metric queries, pushdown log reads, stream metadata and ruler state from one Loki, plus offline LogQL tools."
+
+// SchemaDocMD is the main schema's human-facing description.
 const SchemaDocMD = "## main\n\n" +
-	"Everything this worker exposes lives here. Table functions call the Loki HTTP API named by a `loki` secret; " +
-	"scalars inspect LogQL locally.\n\n" +
-	"Reach for `logs` when you want SQL filters pushed into LogQL, and for `query_range` when you need arbitrary " +
-	"LogQL such as parsers, `line_format` or metric aggregations."
+	"Table functions call the Loki HTTP API named by a `loki` secret (bearer token or basic auth, optional " +
+	"`X-Scope-OrgID` tenant); pass `secret_name` to choose between several. Scalars inspect LogQL locally and need no " +
+	"secret.\n\n" +
+	"Conventions: log rows carry `ts` (`TIMESTAMPTZ`) and exact `ts_ns`, common stream labels hoisted into columns, all " +
+	"labels in a `labels` map, and `structured_metadata` and `parsed` maps. Windows are `start_date`/`end_date`, " +
+	"half-open `[start, end)`. Log results are paged past Loki's 5000-line limit with de-duplication, and metric results " +
+	"use the same long layout as vgi-prometheus so the two UNION.\n\n" +
+	"Reach for `logs` when you want SQL filters pushed into LogQL (label matchers, line filters, the time window, " +
+	"newest-first `LIMIT`), and for `query_range` when you need arbitrary LogQL such as parsers, `line_format` or metric " +
+	"aggregations."
 
 // agentTask is one public analyst task for `vgi-lint simulate`.
 type agentTask struct {
