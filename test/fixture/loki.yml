@@ -1,0 +1,59 @@
+# Monolithic Loki for recording the replay fixtures (test/fixture/run-loki.sh).
+# Filesystem storage, one tenant ("fake", auth disabled), old samples accepted
+# so the deterministic 2026-01-01 data can be pushed, and ingesters queried for
+# every time range so nothing has to be flushed before it is readable.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  reject_old_samples: false
+  allow_structured_metadata: true
+  volume_enabled: true
+  max_entries_limit_per_query: 5000
+  split_queries_by_interval: 1h
+  discover_log_levels: true
+  max_query_length: 0
+
+pattern_ingester:
+  enabled: true
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /etc/loki/rules
+  rule_path: /tmp/loki-rules-scratch
+  evaluation_interval: 15s
+  enable_api: true
+  ring:
+    kvstore:
+      store: inmemory
+
+analytics:
+  reporting_enabled: false

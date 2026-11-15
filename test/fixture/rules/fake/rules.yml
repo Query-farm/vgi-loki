@@ -1,0 +1,22 @@
+groups:
+  - name: fixture-alerts
+    interval: 15s
+    rules:
+      - alert: FixtureAlwaysFiring
+        expr: vector(1) > 0
+        for: 0s
+        labels:
+          severity: info
+        annotations:
+          summary: Always firing, so the alerts table has a row.
+      - alert: CheckoutErrors
+        expr: sum by (app) (count_over_time({app="checkout", level="error"}[5m])) > 10
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.app }} is logging errors"
+  - name: fixture-recording
+    rules:
+      - record: app:log_lines:rate5m
+        expr: sum by (app) (rate({namespace="shop"}[5m]))
