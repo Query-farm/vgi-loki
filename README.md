@@ -1,300 +1,287 @@
-<!-- managed-by: vgi-starters (edit upstream in shared/README.md.tmpl, then run tools/render.py) -->
 <p align="center">
   <img src="https://query.farm/media-kit/products/vgi/vgi-logo.png" alt="Vector Gateway Interface (VGI)" width="320">
 </p>
 
-<p align="center"><em>A Query.Farm VGI worker for DuckDB, written in Go.</em></p>
+# Query Grafana Loki Logs With LogQL and SQL in DuckDB
 
-# VGI Loki Worker — Go
+> **vgi-loki** · a [Query.Farm](https://query.farm) VGI worker
 
 [![CI](https://github.com/Query-farm/vgi-loki/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-loki/actions/workflows/ci.yml)
 [![vgi worker: query.farm](https://query.farm/media-kit/shields/vgi-worker.svg)](https://query.farm)
 
-[VGI](https://query.farm/vgi) lets DuckDB call functions that live in a separate
-process: your code, in any language, exposed as ordinary SQL. This worker adds
-three example functions that you rename and replace with your own:
+Loki answers LogQL, but the answer is a JSON tree that Grafana draws and nothing else can join.
+This worker turns the **Grafana Loki HTTP API** into SQL tables in DuckDB: run LogQL and get
+typed log rows or metric rows, filter log lines with a `WHERE` clause that becomes a LogQL
+stream selector and line filters, audit streams, volume, fields and ruler state, and join it
+all with your Parquet, CSV or warehouse tables.
 
-| Function | Kind | Shows you how to |
-|---|---|---|
-| `greet(name)` / `greet(name, style)` | scalar | vectorize over a column, overload, constrain a constant |
-| `sequence_table(count, step := 1)` | table | stream rows in batches, take named arguments |
-| `fetch_items(base_url, page_size := 100)` | table | page through a REST API, retry, read a secret |
+It works with self-hosted **Loki** (single binary or behind the query frontend), **Grafana
+Cloud Logs** (basic auth) and anything that serves the Loki API behind a bearer token. It is
+**read-only**: no push, no deletes, no admin endpoints.
 
+- `query_range` runs any LogQL. A **log query** returns one row per line: `ts TIMESTAMPTZ`,
+  `ts_ns BIGINT` (Loki's full nanosecond precision), hoisted stream labels `job`, `namespace`,
+  `pod`, `app`, `level`, every stream label in a `MAP(VARCHAR, VARCHAR)`, `line`,
+  `structured_metadata` and `parsed` maps. Results are paged past the server's 5,000-line limit
+  with exact de-duplication at page boundaries. A **metric query** returns exactly
+  vgi-prometheus's long layout (`labels`, `ts`, `value`, ...) so Loki-derived and Prometheus
+  metrics `UNION ALL`.
+- `logs` returns the same log rows with SQL filters **pushed into LogQL** (stream matchers,
+  `|=` / `!=` line filters, the time window, `ORDER BY ts DESC LIMIT n`), then re-applied exactly.
+- Stream metadata, index statistics, volume, detected fields and labels, patterns, ruler rules
+  and alerts, and LogQL tools that run with no server.
 
 ## Quick start
 
-**Prerequisites:** Go 1.26+ and [uv](https://docs.astral.sh/uv/) (it runs the SQL
-test runner and the metadata checker).
-
-```bash
-make build
-```
-
-Then open DuckDB 2.0 or [Haybarn](https://query.farm/products/haybarn) and attach the
-worker. `LOCATION` is the command DuckDB runs to start it; use an absolute path,
-because a relative one resolves against DuckDB's working directory.
-
-**DuckDB 2.0:**
-
 ```sql
-SET allow_extension_repositories = 'allowed';
-CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm';
-INSTALL vgi FROM query_farm;
-LOAD vgi FROM query_farm;
-ATTACH 'loki' (TYPE vgi, LOCATION '/abs/path/to/vgi-loki/bin/vgi-loki-worker');
-```
-
-**Haybarn 2.0** (`uvx haybarn-cli`):
-
-```sql
-INSTALL vgi FROM community;
+INSTALL vgi FROM community;     -- Haybarn 2.0; on DuckDB 2.0 use the query_farm repository
 LOAD vgi;
-ATTACH 'loki' (TYPE vgi, LOCATION '/abs/path/to/vgi-loki/bin/vgi-loki-worker');
+ATTACH 'loki' (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-loki@v0.1.0');
+
+CREATE SECRET (TYPE loki, BASE_URL 'http://localhost:3100');
+
+-- Error lines from one app in the last hour, newest first.
+SELECT ts, pod, line
+FROM loki.main.logs('{namespace="shop"}')
+WHERE app = 'checkout' AND level = 'error' AND line LIKE '%timeout%'
+  AND ts >= now() - INTERVAL 1 HOUR
+ORDER BY ts DESC LIMIT 50;
 ```
 
-Now call the functions:
+The secret type is registered by the worker, so run `CREATE SECRET` after `ATTACH`.
 
-```sql
-SELECT loki.main.greet('Ada');                         -- Hi, Ada!
-SELECT loki.main.greet('Ada', 'formal');               -- Good day, Ada.
-SELECT * FROM loki.main.sequence_table(5, step := 2) ORDER BY n;
-```
+<details><summary>Other ways to run it</summary>
 
-`fetch_items` pages through a REST API. Try it against the public demo API (25 fixed items):
+- **DuckDB 2.0**:
+  `SET allow_extension_repositories = 'allowed'; CREATE EXTENSION REPOSITORY IF NOT EXISTS query_farm WITH PREFIX 'https://duckdb-extensions.query.farm'; INSTALL vgi FROM query_farm; LOAD vgi FROM query_farm;`
+  then attach as above.
+- **Docker** (HTTP): `docker run -p 8000:8000 ghcr.io/query-farm/vgi-loki:0.1.0`, then
+  `ATTACH 'loki' (TYPE vgi, LOCATION 'http://localhost:8000')`.
+- **Go**: `go install github.com/Query-farm/vgi-loki/cmd/vgi-loki-worker@v0.1.0`,
+  then attach the binary by absolute path.
+- **From source**: `make build` (Go 1.26+, pure Go, no cgo), then
+  `ATTACH 'loki' (TYPE vgi, LOCATION '/abs/path/to/bin/vgi-loki-worker')`.
 
-```sql
-SELECT category, count(*) AS items, round(avg(price), 2) AS avg_price
-FROM loki.main.fetch_items('https://vgi-starter-api.query-farm.services/v1')
-GROUP BY category ORDER BY category;
-```
-
-If an older cached extension misbehaves, refresh it with `FORCE INSTALL vgi FROM query_farm;`
-(DuckDB) or `FORCE INSTALL vgi FROM community;` (Haybarn).
-
-## Using it in a pipeline
-
-Worker functions compose with everything else in DuckDB:
-
-```sql
--- Materialize an API into a local table.
-CREATE TABLE items AS SELECT * FROM loki.main.fetch_items('https://vgi-starter-api.query-farm.services/v1');
-
--- Join it with local files.
-SELECT i.name, i.price, s.units
-FROM items i JOIN 'sales.parquet' s ON s.item_id = i.id;
-
--- Call a scalar per row of another table.
-SELECT customer, loki.main.greet(customer, 'formal') FROM read_csv('customers.csv');
-```
-
-## Project layout
-
-```
-cmd/vgi-loki-worker/  # main.go: the worker binary (flags -> serve.Main)
-internal/loki/
-  worker.go        # assembles the catalog; register new functions in NewWorker
-  meta.go          # catalog/schema metadata + helpers (objectTags, column)
-  greet.go         # scalar example (overloads, constant arg with choices)
-  sequence.go      # table function example (named args, streaming state)
-  fetch_items.go   # REST API table function (pagination, retries, secrets)
-  version.go       # the worker version (checked against release tags)
-  *_test.go        # go test unit tests
-internal/serve/    # --http / --unix / stdio and logging flags, shared with recipes
-test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
-examples/          # recipes (one package main, served by bin/recipes <name>)
-ci/                # integration harness used by `make test-sql` and CI
-scripts/           # vgi_template.py (init / template-diff)
-vgi-agent-tests.yaml  # private graders for the agent test tasks
-```
-
-## Adding a function
-
-1. Create `internal/loki/<name>.go`. Copy the closest example: `greet.go` for a
-   scalar, `sequence.go` for a generator, `fetch_items.go` for an API.
-2. Declare arguments as a struct with `vgi:"..."` tags. Use `pos=N` for positional
-   arguments and `default=V` (no `pos`) for named ones; add `ge=`, `le=`, `pattern=` or
-   `choices='a,b'` constraints. Scalar column arguments are `*array.String` (etc.) fields
-   with `const=false`. `doc=` must be the last key in the tag.
-3. Implement `Name()`, `Metadata()` (with `Description`, `Tags: withExamples(objectTags(...), examples)`
-   and `Examples`), then `OnBindTyped`/`ProcessTyped` (scalar, wrap with
-   `vgi.AsScalarFunction[Args]`) or `ArgumentSpecs`/`OnBind`/`NewState`/`Process` (table,
-   wrap with `vgi.AsTableFunction[State]`).
-4. Register it in `NewWorker` in `internal/loki/worker.go`, and add its examples to
-   `allExamples`.
-
-**Which kind of function?**
-
-| You want to… | Use |
-|---|---|
-| compute one value per input row | a **scalar** function |
-| return a set of rows from arguments (an API, a file, a generator) | a **table** function |
-| transform or aggregate the rows of a query | a **table in-out** function or an **aggregate** |
-| expose a fixed dataset by name (`SELECT * FROM loki.main.t`) | a **catalog table** |
-| write data out to a file or service | `COPY … TO` with a copy function |
-| accept `INSERT` / `UPDATE` / `DELETE` | a catalog table with insert/update/delete functions |
-
-The [examples/](examples/) folder has a recipe for most of these. Writable tables have no
-recipe:
-
-A writable table is a `vgi.CatalogTable` that names a table in-out function per operation in
-`InsertFunction`, `UpdateFunction` and `DeleteFunction`, with the richest result each one
-produces in `WriteResultModes`. A write function declares `vgi.WriteOptionsArgSpec()`, reads
-the requested mode with `vgi.ParseWriteOptions`, and binds and emits
-`vgi.WriteResultSchema` / `vgi.WriteResultBatch`. UPDATE and DELETE need a `vgi.RowIDField`
-column emitted by a scan that declares projection pushdown. Transactions:
-`vgi.WithSupportsTransactions` (or `AttachDecision.SupportsTransactions` per ATTACH) and
-`vgi.WithTransactionHooks`. Since VGI protocol 3.3 a table's scan and write functions are
-table-only: hidden from `duckdb_functions()` and not callable from SQL. Set `ExposeScan: true`
-on the table to keep the scan callable as an ordinary table function too (write functions never
-are). The write helpers and transaction hooks need vgi-go v0.42.0 or newer: if `go.mod` has an
-older v0.42.x, run `go get github.com/Query-farm/vgi-go@v0.42` (the newest v0.42.x; every
-v0.42.x speaks the same protocol). See
-[Writable catalog tables](https://github.com/Query-farm/vgi-go#writable-catalog-tables) and
-[`examples/writable_tx`](https://github.com/Query-farm/vgi-go/tree/main/examples/writable_tx).
+v0.1.0 is not published yet. Until it is, build from source.
+</details>
 
 ## Secrets and configuration
 
-`fetch_items` shows the recommended pattern. A bearer token comes from a DuckDB secret
-when one exists, and from an environment variable otherwise:
+Every function that calls a server reads a DuckDB secret of type `loki`:
+
+| Field | Meaning |
+|---|---|
+| `BASE_URL` | Server root; `/loki/api/v1/...` (and `/prometheus/api/v1/...` for the ruler) is appended. `http://loki:3100`, `http://loki-gateway.monitoring`, `https://logs-prod-012.grafana.net`. |
+| `BEARER_TOKEN` | Sent as `Authorization: Bearer …`. Redacted. |
+| `USERNAME` / `PASSWORD` | Basic auth (Grafana Cloud Logs: the numeric instance id and an access-policy token with `logs:read`). Password redacted. |
+| `TENANT_ID` | Sent as `X-Scope-OrgID` (multi-tenant Loki). |
+| `EXTRA_HEADERS` | JSON object of extra request headers, e.g. `'{"X-Custom": "v"}'`. Redacted. |
 
 ```sql
-CREATE SECRET (TYPE loki_api, TOKEN 'your-token');      -- per session, never logged
+-- Grafana Cloud Logs
+CREATE SECRET grafana (TYPE loki, BASE_URL 'https://logs-prod-012.grafana.net',
+                       USERNAME '123456', PASSWORD 'glc_...');
+-- Self-hosted, one tenant
+CREATE SECRET team_a (TYPE loki, BASE_URL 'http://loki-gateway:80', TENANT_ID 'team-a');
+
+SELECT * FROM loki.main.build_info(secret_name := 'team_a');
 ```
 
-```bash
-LOKI_API_TOKEN=your-token make run-http                # for servers and containers
-```
+With several secrets, pick one per call with `secret_name := '...'` (the worker asks DuckDB for
+that secret by name at bind time). Credentials never enter table-function state or logs.
+Requests that get 429, 502, 503 or 504 are retried with exponential backoff, honouring
+`Retry-After`; other errors carry the HTTP status and Loki's message. Every request asks for
+`X-Loki-Response-Encoding-Flags: categorize-labels`, so stream labels, structured metadata and
+parsed labels come back separately instead of merged.
 
-Try it: the demo API's `/v1/auth` endpoint needs the published token `demo-token`.
+## What's inside
+
+All objects are in `loki.main`.
+
+| Function | What it returns |
+|---|---|
+| `query_range(logql, start, end, max_lines := NULL, direction := 'backward', step := NULL, page_size := 5000, chunk_seconds := 3600, max_points_per_chunk := 11000)` | Log rows for a log query, metric rows for a metric query (`/loki/api/v1/query_range`). |
+| `query(logql, time := …)` | Instant metric query (`/loki/api/v1/query`); metric rows. Loki rejects log queries here. |
+| `logs(selector, label_columns := '', start_date, end_date, max_lines, direction, page_size, chunk_seconds)` | Log rows with filter pushdown. `logs()` without a selector builds it from `WHERE`. |
+| `labels(match := …, start_date, end_date)` | Stream label names. |
+| `label_values(label, match := …, start_date, end_date)` | Values of one stream label. |
+| `series(match, start_date, end_date)` | Every stream (label set) matching a selector, labels hoisted. |
+| `index_stats(query, start_date, end_date)` | `streams`, `chunks`, `entries`, `bytes` a selector covers: cost before you query. |
+| `volume(query, target_labels := …, aggregate_by := 'series', top_n := 100, …)` | Ingested bytes per label set (`index/volume`). |
+| `detected_fields(query, start_date, end_date)` | Fields inside lines with type, cardinality, parsers and JSON path (Loki 3.x). |
+| `detected_labels(query := …, start_date, end_date)` | Stream labels with cardinality (Loki 3.x). |
+| `patterns(query, step := …, start_date, end_date)` | Pattern-ingester patterns, one row per pattern per bucket. |
+| `rules(rule_type := 'any')` | Ruler recording and alerting rules (LogQL) with health and state. |
+| `alerts()` | Active ruler alerts. |
+| `build_info()` | Server version and build. |
+| `format_query(logql)` | Server-side validation: `valid`, canonical `formatted` text, parser `error`. |
+| `logql_quote(s)` | `s` as an escaped LogQL string literal. |
+| `query_type(logql)` | `'log'`, `'metric'`, or `NULL` when it does not lex. |
+| `stream_selectors(logql)` | `VARCHAR[]` of every `{...}` selector in the query. |
+| `selector_labels(logql)` | `VARCHAR[]` of the label names those selectors match on. |
+
+**Log rows** (`query_range` with a log query, `logs`): `ts`, `ts_ns`, `job`, `namespace`, `pod`,
+`app`, `level` (stream labels, `NULL` when absent), any `label_columns`, `labels`, `line`,
+`structured_metadata` (e.g. `trace_id`, Loki's `detected_level`) and `parsed` (fields from
+`| json`, `| logfmt`, `| regexp`, `| pattern` in your LogQL). Parsing happens in LogQL, not in
+the worker: `logs('{app="api"} | json')` then `parsed['status']`.
+
+**Metric rows** (`query`, `query_range` with a metric query): `result_type`, `metric` (always
+`NULL`), `job`, `instance`, `labels`, `ts`, `value` (`NaN`/`±Inf` kept), `histogram` (always
+`NULL`), `string_value`: the same columns and types as vgi-prometheus `query_range`.
 
 ```sql
-SELECT count(*) FROM loki.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- fails: HTTP 401
-CREATE SECRET (TYPE loki_api, TOKEN 'demo-token');
-SELECT count(*) FROM loki.main.fetch_items('https://vgi-starter-api.query-farm.services/v1/auth');   -- 25
+-- Log-derived and Prometheus metrics side by side.
+SELECT 'loki' AS source, labels['app'] AS app, ts, value FROM loki.main.query_range(
+  'sum by (app) (rate({namespace="shop"} |= "error" [5m]))', now() - INTERVAL 1 HOUR, now(), step := 60)
+UNION ALL BY NAME
+SELECT 'prometheus', labels['app'], ts, value FROM prometheus.main.query_range(
+  'sum by (app) (rate(http_requests_total{code=~"5.."}[5m]))', now() - INTERVAL 1 HOUR, now(), 60);
 ```
 
-Never bake credentials into the image or the source. If a function can't run without
-real credentials, its examples can't execute in CI either. Set `execute: false` on the
-metadata check for that worker (see `.github/workflows/ci.yml`), and add
-`LINT_ARGS ?= --no-execute` to the Makefile so local runs match.
+### Paging and chunking
 
-## Testing
+Loki caps each request at `max_entries_limit_per_query` (5,000 by default). A log scan reads the
+window in epoch-aligned `chunk_seconds` pieces (matching the query frontend's
+`split_queries_by_interval`, so its results cache is reused), newest first for `backward`, and
+pages inside each piece: when a page comes back full, the next request ends just after
+(backward) or starts at (forward) the timestamp of the last entry, and entries at that timestamp
+that were already returned are skipped. If `page_size` entries share one timestamp the scan
+stops with an error rather than lose lines (raise `page_size`). The cursor is part of the
+table-function state, so over the HTTP transport each page can be served by a different request.
 
-```bash
-make test-unit                 # fast Go unit tests
-make test-sql                  # test/sql/*.test through DuckDB (stdio)
-make test-sql TRANSPORT=http   # …over HTTP (also: launch)
-make check                     # everything CI runs
-```
+Metric range queries are split into requests of at most `max_points_per_chunk` steps (Loki
+rejects more than 11,000 points per series); the step is never changed. Without `step :=` the
+worker uses Loki's own default, `max(1, floor(range_seconds / 250))`, and sends it explicitly.
 
-`test/sql/*.test` files are [sqllogictest](https://duckdb.org/docs/stable/dev/sqllogictest/intro)
-scripts. `ci/run-integration.sh` runs them against your worker and fails on any
-unexpected skip, so a broken transport can't hide behind a green run.
-`fetch_items` is tested against `test/mock_api/server.py` so tests are fast and
-offline.
+## What pushes down
 
-**Testing against real data:** put live tests in their own `.test` file that starts with
-`require-env LOKI_LIVE`. They run only when that variable is set. Add the skip reason
-to `EXPECTED_SKIP_REASONS` in CI.
+`logs` is the pushdown surface. Its `WHERE` clause compiles into the request:
 
-## Metadata and the quality score
+| SQL on `logs(...)` | Becomes |
+|---|---|
+| `app = 'api'`, `namespace <> 'qa'` (hoisted or `label_columns` column) | `app="api"`, `namespace!="qa"` in the stream selector |
+| `pod IN ('a', 'b')`, `pod = 'a' OR pod = 'b'` | `pod=~"a|b"` |
+| `col LIKE 'p%'`, `prefix(col, 'p')`, `contains(col, 'x')`, `col NOT LIKE '…'` | `col=~"…"` / `col!~"…"` |
+| `col IS NULL` / `col IS NOT NULL` | `col=""` / `col!=""` |
+| `contains(line, 'x')`, `line LIKE '%x%'`, `prefix(line, 'x')`, `line = 'x'` | `|= "x"` (each literal run of a `LIKE` pattern becomes one `|=`) |
+| `NOT contains(line, 'x')`, `line NOT LIKE '%x%'` | `!= "x"` |
+| `ts >= …`, `ts < …`, `ts BETWEEN …`, `ts_ns >= …` | the request window `[start, end)` |
+| `ORDER BY ts DESC LIMIT n` (or `ASC`) | `direction=backward` (`forward`) with the scan stopped after `n` lines |
 
-DuckDB, agents and documentation tools discover your functions through their metadata:
-titles, descriptions, argument docs, examples and keywords.
-[vgi-lint](https://github.com/Query-farm/vgi-lint-check) checks it, and CI runs it on
-every push. Its settings live in `vgi-lint.toml`, which `make lint-explain`,
-`vgi-lint lint`, and CI all read. This template scores 100/100 with no findings.
+Line filters are appended **after** your pipeline, so they test the line exactly as returned
+(after any `line_format`); values are escaped as LogQL strings. Every pushed predicate is also
+re-applied by the worker, so results always match the SQL. Not pushed: filters on `labels['x']`,
+`parsed[...]` or `structured_metadata[...]` (DuckDB evaluates them; list a stream label in
+`label_columns` to push it, or write the filter into the LogQL, e.g. `| json | status >= 500`),
+and DuckDB does not push `regexp_matches` or `ILIKE` to table functions (use `|~` in the
+selector argument). When your pipeline contains `label_format`, `drop` or `keep`, label filters
+are not pushed, because the returned labels are no longer the stream's. Loki requires one
+stream matcher that cannot match the empty string; `logs()` says so before calling the server.
+The window defaults to the last hour, like Loki.
 
-```bash
-make lint-explain                              # findings, each with its fix
-make lint-explain LINT_ARGS="--format agent"   # the same, grouped for coding agents
-make lint-ai                                   # optional: an agent must solve vgi-agent-tests.yaml
-```
-
-Each report also states an **assurance level**: how much was actually verified.
-
-| Level | Reached when | Here |
-|---|---|---|
-| L1 structural | the static metadata is clean | workers that need real credentials (`execute: false` in CI) |
-| L2 behavioural | the examples also run and return what they claim | **the CI gate** |
-| L3 semantic | an agent solves the worker's own test tasks, and the docs are reviewed | `make lint-ai`, before publishing |
-
-- **How strict.** Your copy fails on warnings (`fail_on = "warning"` in `vgi-lint.toml`).
-  Raise it to `"info"` before you publish the worker for others.
-- **The linter isn't pinned.** It tracks the current quality bar, so a new rule can flag
-  metadata that passed yesterday. Fix it, or waive the finding.
-- **Waivers.** If a finding is genuinely wrong for your worker, waive it in
-  `vgi-lint.toml` with a `kind` and a `reason`.
-- **Existing workers.** If you're adding this gate to a worker that already has
-  findings, record them with `vgi-lint lint --baseline vgi-lint-baseline --update-baseline`
-  and set `baseline` in `vgi-lint.toml`. After that, only new findings fail.
-
-Metadata lives in `internal/loki/meta.go` and each function's `Metadata()`.
-
-## Logging and debugging
-
-stdout carries the Arrow protocol, so **never print to stdout**. Log to stderr instead.
-Use `log/slog` (the SDK configures it to write to stderr); `--debug` or `--log-level debug` turns it up.
-
-- Under DuckDB (stdio/launch), worker stderr shows up in DuckDB's error messages and
-  terminal.
-- In Docker it goes to `docker logs`.
-- `make debug` runs one query against the worker with debug logging on.
-
-## Deploying
-
-The same binary serves stdio (DuckDB starts it locally) or HTTP (you host it):
-
-```bash
-docker build -t weather-worker .
-docker run -p 8000:8000 -e LOKI_API_TOKEN=... weather-worker   # health: GET /health
-```
+## Examples
 
 ```sql
-ATTACH 'loki' (TYPE vgi, LOCATION 'https://workers.example.com/loki');
+-- How much would this query read?
+SELECT streams, entries, round(bytes / 1e9, 2) AS gb
+FROM loki.main.index_stats('{namespace="prod"}', start_date := now() - INTERVAL 1 DAY);
+
+-- Noisiest apps by ingested bytes.
+SELECT labels['app'] AS app, bytes FROM loki.main.volume('{namespace="prod"}', target_labels := 'app')
+ORDER BY bytes DESC LIMIT 10;
+
+-- 5xx responses per route from JSON logs, parsed by LogQL.
+SELECT parsed['route'] AS route, count(*) AS errors
+FROM loki.main.logs('{app="api"} | json | status >= 500')
+WHERE ts >= now() - INTERVAL 6 HOUR
+GROUP BY route ORDER BY errors DESC;
+
+-- Join log lines to a trace table through structured metadata.
+SELECT l.ts, l.line, t.duration_ms
+FROM loki.main.logs('{app="checkout"}') l JOIN 'traces.parquet' t
+  ON t.trace_id = l.structured_metadata['trace_id']
+WHERE l.level = 'error' AND l.ts >= now() - INTERVAL 1 HOUR;
+
+-- Which stream labels do the ruler's rules depend on?
+SELECT l AS label, count(*) AS rules
+FROM loki.main.rules(), unnest(loki.main.selector_labels(query)) u(l)
+GROUP BY l ORDER BY rules DESC;
+
+-- Export a day of one app's logs to Parquet.
+COPY (SELECT * FROM loki.main.logs('{app="api"}', start_date := now() - INTERVAL 1 DAY)) TO 'api.parquet';
 ```
 
-Put hosted workers behind TLS and authentication. See
-[authentication](https://query.farm/vgi/authentication) for bearer tokens and JWTs, and
-[distributing a worker](https://query.farm/vgi/distributing-a-worker) for packaging.
-Pass secrets with `-e` or your platform's secret manager.
+## How it is tested
 
-## Releasing
+`make check` runs gofmt, go vet, golangci-lint, `go test` (lexer, pushdown planning, exact filter
+evaluation, decoding, and the paging engine against a fake server that models Loki's limit,
+direction and boundary behaviour), the SQL suite (`test/sql/loki.test`, ~85 statements) over the
+stdio, launch and HTTP transports, and vgi-lint at `fail_on = "info"`.
 
-Push a tag like `v0.1.0`. The release workflow builds signed binaries for linux (amd64, arm64), macOS (arm64) and Windows (amd64) as static pure-Go binaries, and attaches them to the GitHub release. Users download the archive for their platform and point `LOCATION` at the binary inside. Go developers can also `go install github.com/Query-farm/vgi-loki/cmd/vgi-loki-worker@v0.1.0`. Every artifact is signed with cosign and
-carries SLSA build provenance. `ci/check-version.sh` makes sure the tag matches the
-version in `internal/loki/version.go`.
+**CI needs no Docker and no credentials.** The SQL suite talks to
+`test/fixture_server/server.py`, which replays **recorded responses** from
+`test/fixture_server/recorded.json` (keyed by path and sorted query/form parameters) plus a few
+hand-written ones in `handwritten.json` for shapes a stock server will not produce on demand
+(a 503, a warning, pattern-ingester output, a 404 from an older Loki). The runner starts two
+copies: one answers every request with `429 + Retry-After: 0` once (so retries are always
+exercised), the other demands a bearer token or basic auth plus `X-Scope-OrgID: tenant-a`.
 
-## Using with coding agents
+**The recordings come from a real Loki.** `test/fixture/run-loki.sh start` runs
+`grafana/loki:3.7.0` in monolithic mode with filesystem storage (about 150 MB RAM, capped at
+768 MB), pushes deterministic streams from `test/fixture/gen_push.py` through
+`/loki/api/v1/push` (2026-01-01 00:00–02:00 UTC: logfmt and JSON lines, structured metadata, a
+multi-line entry, 6,200 lines in one stream to force paging, entries sharing timestamps, and
+quotes, backslashes, tabs and Unicode in labels and lines), flushes the ingester and loads the
+ruler rules in `test/fixture/rules`. To re-record after changing the tests:
 
-[AGENTS.md](AGENTS.md) is written for AI coding agents (Claude Code reads it via
-`CLAUDE.md`; Codex, Cursor and others read it directly). It covers the commands, the
-recipe for adding a function, the metadata checklist and the sharp edges. A good first
-prompt:
+```bash
+test/fixture/run-loki.sh start            # prints http://127.0.0.1:13100
+rm test/fixture_server/recorded.json
+LOKI_RECORD_UPSTREAM=http://127.0.0.1:13100 make test-sql
+test/fixture/run-loki.sh stop
+```
 
-> Read AGENTS.md. Replace `fetch_items` with `forecast(lat DOUBLE, lon DOUBLE)` that calls
-> the Open-Meteo API. Include full metadata, a mock-server test and a `LOKI_LIVE` test.
-> You're done when `make check` passes.
+Point the worker at either fixture through the secret's `BASE_URL`; there are no test-only
+code paths. Recorded bodies have Loki's per-query `stats` block removed.
 
-## Keeping up with the template
+## Known limitations
 
-`make template-diff` shows what changed upstream (CI, docs, examples) since your copy was
-made. Your copy records its template version in `.vgi-loki.json`.
+- **Time zone.** vgi-go 0.42.0 cannot decode a pushed `TIMESTAMPTZ` filter in a session whose
+  `TimeZone` is not UTC. Use `SET TimeZone = 'UTC'` with `WHERE ts …` on `logs`, or pass
+  `start_date :=` / `end_date :=` (or filter `ts_ns`), which work in any time zone.
+- **No embedded LogQL parser.** Loki's parser (`pkg/logql/syntax`) is AGPL-3.0 and drags in etcd,
+  Kubernetes, Redis and a forked memberlist, so the worker has its own small lexer. It decides
+  log vs metric (`query_type`), finds selectors and merges pushed filters, but it does not
+  validate a query: `format_query()` asks the server.
+- **A Loki 3.7 boundary quirk.** Loki skips a stored chunk whose last entry sits exactly on the
+  query's `start`. The worker therefore always asks from one nanosecond earlier and discards
+  what falls before the window; without that, forward paging and `WHERE ts >= …` could silently
+  drop lines.
+- **Old data and ingesters.** A stock Loki only asks ingesters about the last
+  `query_ingesters_within` (3 h); older entries are served from the store once flushed.
+- `query` and `query_range` do not parse LogQL to push SQL filters; filter in the LogQL, or
+  use `logs`.
+- `regexp_matches` / `ILIKE` are not pushed by DuckDB; `LIMIT` without `ORDER BY ts` is not sent
+  to Loki (DuckDB still stops the scan after the rows it needs).
+- No live tail (`/loki/api/v1/tail`), no push or delete APIs (read-only by design), no TLS
+  client certificates (put a proxy in front, or use a bearer token).
+- `patterns()` only sees what the pattern ingester holds (recent data, when enabled).
 
-## Learn more
+## Development
 
-- [What is VGI?](https://query.farm/vgi) · [Getting started](https://query.farm/vgi/getting-started) · [Building a worker](https://query.farm/vgi/building-a-worker)
-- [Go SDK docs](https://query.farm/vgi/docs/go/): [scalar tutorial](https://query.farm/vgi/docs/go/tutorial/scalar/), [table tutorial](https://query.farm/vgi/docs/go/tutorial/table/)
-- [Distributing a worker](https://query.farm/vgi/distributing-a-worker) · [Choosing a language](https://query.farm/vgi/languages) · [llms.txt](https://query.farm/vgi/llms.txt)
-- SDK source: [vgi-go](https://github.com/Query-farm/vgi-go) · RPC layer: [https://vgi-rpc-go.query.farm](https://vgi-rpc-go.query.farm)
+See [AGENTS.md](AGENTS.md) for the layout, the recipe for adding a function and the sharp
+edges. `make help` lists the targets; `make template-diff` shows upstream starter changes
+(this worker started from vgi-starter-go v1.3.0).
 
 ## Support
 
 Open an issue on this repository. For VGI itself, see [query.farm](https://query.farm).
 
-## Authorship & license
+## Authorship & License
 
-The starter template is written by [Query.Farm](https://query.farm) and released under
-the [BSD Zero Clause License](LICENSE) (0BSD). Use it for anything, with no attribution
-required. Replace this section with your own license once the code is yours.
+Copyright 2026 Query Farm LLC - https://query.farm
+
+Released under the [BSD Zero Clause License](LICENSE) (0BSD). Grafana Loki is a Grafana Labs
+project; this worker is not affiliated with or endorsed by Grafana Labs. It talks to Loki over
+its HTTP API and embeds no Loki code.

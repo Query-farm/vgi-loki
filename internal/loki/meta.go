@@ -160,7 +160,7 @@ const schemaDocLLM = "The main schema holds every function. Table functions that
 	"(query_range takes start and end positionally); log windows are [start, end). Log rows: read a stream label with " +
 	"labels['name'], a parsed field with parsed['name'] (add | json or | logfmt to the LogQL), structured metadata with " +
 	"structured_metadata['name']. In logs(), list a stream label in label_columns to get a pushdown column. Scalars " +
-	"(logql_quote, query_type, stream_selectors, selector_labels) take one VARCHAR column and need no secret."
+	"(logql_quote, query_type, stream_selectors, selector_labels) take one `VARCHAR` column and need no secret."
 
 // SchemaDocMD is the main schema's human-facing description (also its comment).
 const SchemaDocMD = "## main\n\n" +
@@ -192,6 +192,15 @@ var agentTestTasks = []agentTask{
 	{Name: "shop_volume", Prompt: "How many entries and bytes does the shop namespace have between 2026-01-01 00:00 and 02:00 UTC?"},
 	{Name: "firing_alerts", Prompt: "Which Loki ruler alerts are currently firing?"},
 	{Name: "server_version", Prompt: "Which Loki version is the server running?"},
+	{Name: "instant_levels", Prompt: "How many checkout log lines per level were written in the two hours before 2026-01-01 02:00 UTC? Use one instant metric query."},
+	{Name: "shop_labels", Prompt: "Which stream label names does the shop namespace use between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "shop_streams", Prompt: "List the shop namespace's streams (app, pod, level) between 2026-01-01 00:00 and 02:00 UTC."},
+	{Name: "namespace_volume", Prompt: "Which namespaces ingested any bytes between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "shop_label_cardinality", Prompt: "What is the cardinality of each stream label Loki detects in the shop namespace between 2026-01-01 00:00 and 02:00 UTC?"},
+	{Name: "bulk_patterns", Prompt: "Which log patterns does the pattern ingester report for the bulk app between 2026-01-01 01:00 and 02:00 UTC?"},
+	{Name: "alert_rules", Prompt: "List the Loki ruler's alerting rules with their 'for' duration in seconds."},
+	{Name: "canonical_logql", Prompt: "What is the server's canonical form of the LogQL 'sum(rate({app=\"x\"}|=\"a\"[5m]))by(b)'?"},
+	{Name: "query_selectors", Prompt: "Using the loki worker, list the stream selectors in 'sum(rate({app=\"api\", level=\"error\"}[5m])) / sum(rate({app=\"api\"}[5m]))'."},
 }
 
 // CatalogTags are the catalog-level discovery tags.

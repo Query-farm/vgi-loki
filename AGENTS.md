@@ -24,15 +24,25 @@ Faster loops while iterating: `make test-unit`, `make test-sql`, `make lint-expl
 cmd/vgi-loki-worker/  # main.go: the worker binary (flags -> serve.Main)
 internal/loki/
   worker.go        # assembles the catalog; register new functions in NewWorker
-  meta.go          # catalog/schema metadata + helpers (objectTags, column)
-  greet.go         # scalar example (overloads, constant arg with choices)
-  sequence.go      # table function example (named args, streaming state)
-  fetch_items.go   # REST API table function (pagination, retries, secrets)
+  meta.go          # catalog/schema metadata, categories, agent tasks + helpers
+  client.go        # secret -> connection, HTTP GET/POST with retries, envelopes, errors
+  query.go         # query / query_range (log or metric by query kind, chunked, resumable)
+  logscan.go       # the paged, chunked log scan: page boundaries, de-duplication, cursor
+  logs.go          # logs(): SQL filters -> LogQL selector, line filters, window
+  selector.go      # pushdown planning (matchers, line filters, time window)
+  filters.go       # pushed-filter capture and exact re-evaluation in the worker
+  sqlparse.go      # parser for the SQL the SDK renders for expression filters
+  logql.go         # small LogQL lexer: query kind, selectors, matchers, merging
+  model.go rows.go # API result decoding (streams, matrix/vector) -> Arrow
+  catalog_funcs.go # labels, values, series, stats, volume, detected_*, patterns, rules, alerts, build info, format_query
+  simple.go        # shared one-request table-function shape
+  compute.go       # offline LogQL scalars
   version.go       # the worker version (checked against release tags)
   *_test.go        # go test unit tests
 internal/serve/    # --http / --unix / stdio and logging flags, shared with recipes
 test/sql/          # sqllogictest files run through DuckDB
-test/mock_api/     # offline mock of the REST API used by tests
+test/fixture_server/  # replay server: recorded.json (live Loki) + handwritten.json
+test/fixture/      # live Loki fixture (grafana/loki + deterministic pushes) used to record
 examples/          # recipes (one package main, served by bin/recipes <name>)
 ci/                # integration harness used by `make test-sql` and CI
 scripts/           # vgi_template.py (init / template-diff)
@@ -41,8 +51,8 @@ vgi-agent-tests.yaml  # private graders for the agent test tasks
 
 ## Recipe: add a function
 
-1. Create `internal/loki/<name>.go`. Copy the closest example: `greet.go` for a
-   scalar, `sequence.go` for a generator, `fetch_items.go` for an API.
+1. Create `internal/loki/<name>.go`. Copy the closest example: `compute.go` for a
+   scalar, `catalog_funcs.go` for a one-request API call, `logs.go` for pushdown.
 2. Declare arguments as a struct with `vgi:"..."` tags. Use `pos=N` for positional
    arguments and `default=V` (no `pos`) for named ones; add `ge=`, `le=`, `pattern=` or
    `choices='a,b'` constraints. Scalar column arguments are `*array.String` (etc.) fields
@@ -140,8 +150,8 @@ v0.42.x speaks the same protocol). See
 - **State must be serializable.** Table-function state (the `S` in `TypedTableFunc[S]`) is gob-encoded into the HTTP continuation token between batches, because each batch can be served by a different request or process. Keep the cursor in *exported* fields (gob silently drops unexported ones, so the scan would restart from row 0), keep it small, and never put secrets in it.
 - **Examples must be deterministic.** Add `ORDER BY`, and no `now()`, random values or
   network. Examples that hit a live API go in `examples`, not `executable_examples`.
-- **Credentials.** Read them from a DuckDB secret first (`CREATE SECRET (TYPE loki_api, …)`),
-  then from an environment variable. Never put them in logs, examples or the repo, and
+- **Credentials.** Read them from the `loki` DuckDB secret
+  (`CREATE SECRET (TYPE loki, BASE_URL …)`), never from environment variables. Never put them in logs, examples or the repo, and
   keep them out of table-function state unless the state rule above says
   the SDK encrypts it. Workers that need real credentials set `execute: false` on the metadata check.
 - **Errors.** Raise errors with a clear message. For HTTP failures, include the status
@@ -185,10 +195,28 @@ v0.42.x speaks the same protocol). See
   dependency ships to every user of the worker.
 - Gates: `gofmt`, `go vet`, `golangci-lint` (config in `.golangci.yml`), `go test`.
 
+## Loki specifics
+
+- **Never embed `github.com/grafana/loki/v3/pkg/logql/syntax`.** It is AGPL-3.0 and pulls etcd,
+  Kubernetes, Redis and a forked memberlist (a `replace` this module would have to carry).
+  `logql.go` is this worker's own lexer; `format_query()` asks the server for real validation.
+- **`query_range`'s schema depends on the query kind**, decided at bind by `analyzeLogQL`
+  (`IsLog`: the first significant token is `{`). Keep `metricColumns` identical to
+  vgi-prometheus's `queryColumns` so the two UNION.
+- **Paging lives in `logscan.go`.** Every request starts 1 ns before the window: Loki 3.7
+  skips a chunk whose last entry sits exactly on the query start (verified against the store),
+  which would drop entries at forward page boundaries. Do not remove it without re-checking
+  against a real server; `TestLogScanPagesExactlyOnce` models the quirk.
+- **Every request sends `X-Loki-Response-Encoding-Flags: categorize-labels`**, so stream labels,
+  structured metadata and parsed labels arrive separately. The replay server rejects requests
+  without it.
+- **Re-recording:** `test/fixture/run-loki.sh start`, delete `test/fixture_server/recorded.json`,
+  `LOKI_RECORD_UPSTREAM=http://127.0.0.1:13100 make test-sql`, then `run-loki.sh stop`.
+
 ## Useful prompts
 
 - "Add a scalar `slugify(text VARCHAR) -> VARCHAR` with full metadata and tests."
-- "Replace `fetch_items` with a table function for <API>. Map its JSON to typed columns,
-  read the token from a `loki_api` secret, and add mock-server tests."
+- "Add a `tail(selector)` table function over /loki/api/v1/tail, record its fixture
+  responses with `LOKI_RECORD_UPSTREAM`, and add SQL tests."
 - "Add a catalog table `countries` (code, name) with a primary key, following
   `examples/catalog_tables`."

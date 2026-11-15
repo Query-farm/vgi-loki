@@ -33,7 +33,7 @@ import (
 type logsArgs struct {
 	Selector string `vgi:"pos=0,doc=LogQL log query: a stream selector with an optional pipeline, e.g. '{namespace=\"shop\"}' or '{app=\"api\"} | json'. Omit it (or pass '{}') to build the selector entirely from WHERE filters on label columns."`
 
-	LabelColumns string     `vgi:"name=label_columns,default=,doc=Comma-separated extra stream labels to expose as their own VARCHAR columns (after job/namespace/pod/app/level) so WHERE filters on them push into the selector, e.g. 'cluster,service_name'."`
+	LabelColumns string     `vgi:"name=label_columns,default=,doc=Comma-separated extra stream labels to expose as their own columns (after job/namespace/pod/app/level) so WHERE filters on them push into the selector, e.g. 'cluster,service_name'."`
 	StartDate    *time.Time `vgi:"name=start_date,doc=Window start (inclusive) when not given by WHERE ts >= ...; default: one hour before the end, like Loki."`
 	EndDate      *time.Time `vgi:"name=end_date,doc=Window end (exclusive) when not given by WHERE ts < ...; default: now."`
 	MaxLines     *int64     `vgi:"name=max_lines,ge=1,doc=Stop after this many matching lines. NULL (default) reads every line; a SQL LIMIT also stops the scan early."`
@@ -45,7 +45,7 @@ type logsArgs struct {
 
 // logsNoSelectorArgs are the arguments of the logs(...) overload without a selector.
 type logsNoSelectorArgs struct {
-	LabelColumns string     `vgi:"name=label_columns,default=,doc=Comma-separated extra stream labels to expose as their own VARCHAR columns (after job/namespace/pod/app/level) so WHERE filters on them push into the selector, e.g. 'cluster,service_name'."`
+	LabelColumns string     `vgi:"name=label_columns,default=,doc=Comma-separated extra stream labels to expose as their own columns (after job/namespace/pod/app/level) so WHERE filters on them push into the selector, e.g. 'cluster,service_name'."`
 	StartDate    *time.Time `vgi:"name=start_date,doc=Window start (inclusive) when not given by WHERE ts >= ...; default: one hour before the end, like Loki."`
 	EndDate      *time.Time `vgi:"name=end_date,doc=Window end (exclusive) when not given by WHERE ts < ...; default: now."`
 	MaxLines     *int64     `vgi:"name=max_lines,ge=1,doc=Stop after this many matching lines. NULL (default) reads every line; a SQL LIMIT also stops the scan early."`

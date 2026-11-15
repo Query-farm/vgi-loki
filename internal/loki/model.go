@@ -130,15 +130,6 @@ type rawResult struct {
 	Result     json.RawMessage `json:"result"`
 }
 
-// resultType peeks at a query result's type.
-func resultType(data json.RawMessage) (string, error) {
-	var rr rawResult
-	if err := json.Unmarshal(data, &rr); err != nil {
-		return "", fmt.Errorf("decoding query result: %w", err)
-	}
-	return rr.ResultType, nil
-}
-
 // decodeMetric turns a matrix/vector/scalar result into long rows.
 func decodeMetric(data json.RawMessage) ([]row, error) {
 	var rr rawResult

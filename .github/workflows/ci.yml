@@ -96,8 +96,11 @@ jobs:
           location: ${{ github.workspace }}/bin/vgi-loki-worker
           # Set in vgi-lint.toml, so local runs and CI agree.
           fail-on: ${{ steps.lintcfg.outputs.fail_on }}
-          # Set to false if your examples need real credentials or network access.
-          execute: true
+          # Credential-gated: every table function (loki.main.query, query_range,
+          # logs, labels, series, ..., build_info) needs a `loki` secret (BASE_URL plus
+          # a bearer token or basic auth) for a live Loki server, so examples are
+          # not executed here. The offline scalars are covered by the SQL tests.
+          execute: "false"
 
   docker:
     name: Docker image smoke test

@@ -1,16 +1,87 @@
 # Private graders for the public vgi.agent_test_tasks in the worker's catalog metadata.
-# `vgi-lint lint --ai` runs an agent on each prompt and grades it with check_sql.
+# `vgi-lint lint --ai` runs an agent on each prompt and grades it with reference_sql / check_sql.
 # See https://github.com/Query-farm/vgi-lint-check (VGI920).
+#
+# The LogQL-tool tasks need nothing. Every other task reads a Loki server and
+# assumes a `loki` secret whose BASE_URL is the replay fixture
+# (python3 test/fixture_server/server.py) or the live fixture
+# (test/fixture/run-loki.sh); CI cannot run them (execute: false).
 tasks:
-  - name: formal_greeting
-    reference_sql: SELECT loki.main.greet('Grace', 'formal') AS greeting
-  - name: sum_of_squares
-    reference_sql: SELECT sum(squared) AS total FROM loki.main.sequence_table(10)
-  - name: stepped_sequence
-    reference_sql: SELECT n FROM loki.main.sequence_table(4, step := 5) ORDER BY n
-  # Reads the public demo API (https://vgi-starter-api.query-farm.services/v1).
-  - name: items_per_category
+  - name: quote_literal
+    reference_sql: SELECT loki.main.logql_quote('say "hello" to C:\temp') AS literal
+  - name: classify_queries
+    reference_sql: >-
+      SELECT q FROM (VALUES ('{app="x"} |= "err"'), ('rate({app="x"}[5m])'), ('sum by (pod) (count_over_time({app="x"}[1m]))')) t(q)
+      WHERE loki.main.query_type(q) = 'metric' ORDER BY q
+  - name: rule_labels
+    reference_sql: >-
+      SELECT loki.main.selector_labels('sum(count_over_time({namespace="shop", app=~"check.*"}[5m])) / sum(count_over_time({namespace="shop"}[5m]))') AS labels
+  - name: checkout_errors
+    reference_sql: >-
+      SELECT pod, count(*) AS lines FROM loki.main.logs() WHERE app = 'checkout' AND level = 'error'
+        AND ts >= TIMESTAMPTZ '2026-01-01 00:00:00+00' AND ts < TIMESTAMPTZ '2026-01-01 02:00:00+00'
+      GROUP BY pod ORDER BY pod
+  - name: declined_payments
+    reference_sql: >-
+      SELECT count(*) AS lines FROM loki.main.query_range('{app="checkout", level="error"} |= "payment declined"',
+        TIMESTAMPTZ '2026-01-01 00:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00')
+  - name: bulk_failures
+    reference_sql: >-
+      SELECT ts, line FROM loki.main.query_range('{app="bulk"} |= "status=failed"',
+        TIMESTAMPTZ '2026-01-01 01:00:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', direction := 'forward') ORDER BY ts
+  - name: levels_per_half_hour
+    reference_sql: >-
+      SELECT labels['level'] AS level, ts, value AS lines FROM loki.main.query_range('sum by (level) (count_over_time({app="checkout"}[30m]))',
+        TIMESTAMPTZ '2026-01-01 00:30:00+00', TIMESTAMPTZ '2026-01-01 02:00:00+00', step := 1800) ORDER BY level, ts
+  - name: shop_apps
+    reference_sql: >-
+      SELECT value AS app FROM loki.main.label_values('app', match := '{namespace="shop"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY app
+  - name: payments_fields
+    reference_sql: >-
+      SELECT field FROM loki.main.detected_fields('{app="payments"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY field
+  - name: shop_volume
+    reference_sql: >-
+      SELECT entries, bytes FROM loki.main.index_stats('{namespace="shop"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00')
+  - name: firing_alerts
     check_sql: >-
-      SELECT count(*) = 3 AND sum(items) = 25
-      FROM (SELECT category, count(*) AS items
-            FROM loki.main.fetch_items('https://vgi-starter-api.query-farm.services/v1') GROUP BY category)
+      SELECT bool_or(alert_name = 'FixtureAlwaysFiring') FROM loki.main.alerts() WHERE state = 'firing'
+  - name: server_version
+    reference_sql: SELECT version FROM loki.main.build_info()
+  - name: instant_levels
+    reference_sql: >-
+      SELECT labels['level'] AS level, value AS lines FROM loki.main.query('sum by (level) (count_over_time({app="checkout"}[2h]))',
+        time := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY level
+  - name: shop_labels
+    reference_sql: >-
+      SELECT label FROM loki.main.labels(match := '{namespace="shop"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY label
+  - name: shop_streams
+    reference_sql: >-
+      SELECT app, pod, level FROM loki.main.series('{namespace="shop"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY app, pod
+  - name: namespace_volume
+    reference_sql: >-
+      SELECT labels['namespace'] AS namespace FROM loki.main.volume('{namespace=~".+"}', target_labels := 'namespace',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00')
+      WHERE bytes > 0 ORDER BY namespace
+  - name: shop_label_cardinality
+    reference_sql: >-
+      SELECT label, cardinality FROM loki.main.detected_labels(query := '{namespace="shop"}',
+        start_date := TIMESTAMPTZ '2026-01-01 00:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY label
+  - name: bulk_patterns
+    # The pattern ingester only tracks recent data: the fixture reports none for 2026-01-01.
+    reference_sql: >-
+      SELECT DISTINCT pattern FROM loki.main.patterns('{app="bulk"}',
+        start_date := TIMESTAMPTZ '2026-01-01 01:00:00+00', end_date := TIMESTAMPTZ '2026-01-01 02:00:00+00') ORDER BY pattern
+  - name: alert_rules
+    reference_sql: >-
+      SELECT rule_name, duration_seconds FROM loki.main.rules(rule_type := 'alert') ORDER BY rule_name
+  - name: canonical_logql
+    reference_sql: >-
+      SELECT formatted FROM loki.main.format_query('sum(rate({app="x"}|="a"[5m]))by(b)')
+  - name: query_selectors
+    reference_sql: >-
+      SELECT loki.main.stream_selectors('sum(rate({app="api", level="error"}[5m])) / sum(rate({app="api"}[5m]))') AS selectors
